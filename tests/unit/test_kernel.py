@@ -41,7 +41,7 @@ class TestBlockSparseFlashAttention:
 
         # All-True block mask
         NB = S // block_size
-        block_mask = torch.ones(B, H, NB, NB, dtype=torch.bool)
+        torch.ones(B, H, NB, NB, dtype=torch.bool)
 
         sparse_attn = BlockSparseFlashAttention(
             block_size=block_size,
@@ -96,9 +96,9 @@ class TestBlockSparseFlashAttention:
         """
         B, H, S, D, block_size = 1, 2, 32, 64, 32
         torch.manual_seed(7)
-        q = torch.randn(B, H, S, D).cuda() if torch.cuda.is_available() else torch.randn(B, H, S, D)
-        k = torch.randn(B, H, S, D).cuda() if torch.cuda.is_available() else torch.randn(B, H, S, D)
-        v = torch.randn(B, H, S, D).cuda() if torch.cuda.is_available() else torch.randn(B, H, S, D)
+        torch.randn(B, H, S, D).cuda() if torch.cuda.is_available() else torch.randn(B, H, S, D)
+        torch.randn(B, H, S, D).cuda() if torch.cuda.is_available() else torch.randn(B, H, S, D)
+        torch.randn(B, H, S, D).cuda() if torch.cuda.is_available() else torch.randn(B, H, S, D)
 
         # All-True mask -> 0% sparsity, which is below any reasonable threshold
         NB = S // block_size

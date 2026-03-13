@@ -73,13 +73,15 @@ class TaskEvalResult:
 
     def __post_init__(self) -> None:
         if not 0.0 <= self.accuracy <= 1.0:
+            msg = f"accuracy must be in [0, 1], got {self.accuracy}"
             raise ValidationError(
-                f"accuracy must be in [0, 1], got {self.accuracy}",
+                msg,
                 context={"accuracy": self.accuracy},
             )
         if self.n_samples <= 0:
+            msg = f"n_samples must be positive, got {self.n_samples}"
             raise ValidationError(
-                f"n_samples must be positive, got {self.n_samples}",
+                msg,
                 context={"n_samples": self.n_samples},
             )
 
@@ -188,7 +190,7 @@ class TaskEvaluator:
             )
 
     def _load_model_and_tokenizer(
-        self, model_path: str
+        self, model_path: str,
     ) -> tuple[torch.nn.Module, object]:
         """Load a HuggingFace model and tokenizer from path.
 
@@ -207,8 +209,9 @@ class TaskEvaluator:
         try:
             from transformers import AutoModelForCausalLM, AutoTokenizer
         except ImportError as exc:
+            msg = "transformers package required for task evaluation"
             raise EvalError(
-                "transformers package required for task evaluation",
+                msg,
                 context={"missing_package": "transformers"},
             ) from exc
 
@@ -228,8 +231,9 @@ class TaskEvaluator:
             model.eval()
             return model, tokenizer
         except Exception as exc:
+            msg = f"Failed to load model from {model_path}: {exc}"
             raise EvalError(
-                f"Failed to load model from {model_path}: {exc}",
+                msg,
                 context={"model_path": model_path, "error": str(exc)},
             ) from exc
 
@@ -259,8 +263,9 @@ class TaskEvaluator:
         try:
             from datasets import load_dataset
         except ImportError as exc:
+            msg = "datasets package required for MedQA evaluation"
             raise EvalError(
-                "datasets package required for MedQA evaluation",
+                msg,
                 context={"missing_package": "datasets"},
             ) from exc
 
@@ -278,8 +283,9 @@ class TaskEvaluator:
         for label in option_labels:
             ids = tokenizer.encode(label, add_special_tokens=False)
             if len(ids) == 0:
+                msg = f"Tokenizer returned empty encoding for option label '{label}'"
                 raise EvalError(
-                    f"Tokenizer returned empty encoding for option label '{label}'",
+                    msg,
                     context={"label": label},
                 )
             option_token_ids.append(ids[0])
@@ -417,8 +423,9 @@ class TaskEvaluator:
         try:
             from human_eval.data import read_problems
         except ImportError as exc:
+            msg = "human_eval package required for HumanEval evaluation"
             raise EvalError(
-                "human_eval package required for HumanEval evaluation",
+                msg,
                 context={"missing_package": "human_eval"},
             ) from exc
 
@@ -437,10 +444,10 @@ class TaskEvaluator:
             test_code = problem["test"]
 
             correct_samples = 0
-            for sample_idx in range(num_samples_per_problem):
+            for _sample_idx in range(num_samples_per_problem):
                 # Generate completion
                 inputs = tokenizer(
-                    prompt, return_tensors="pt", truncation=True, max_length=1024
+                    prompt, return_tensors="pt", truncation=True, max_length=1024,
                 ).to(self._device)
 
                 generated = model.generate(
@@ -576,8 +583,9 @@ class TaskEvaluator:
             "humaneval": self.evaluate_humaneval,
         }
         if domain not in eval_dispatch:
+            msg = f"Unknown domain '{domain}', expected one of {list(eval_dispatch.keys())}"
             raise ValidationError(
-                f"Unknown domain '{domain}', expected one of {list(eval_dispatch.keys())}",
+                msg,
                 context={"domain": domain},
             )
 
@@ -600,7 +608,7 @@ class TaskEvaluator:
         )
 
         # Two-tailed independent samples t-test
-        t_stat, p_value = stats.ttest_ind(tasft_scores, baseline_scores, equal_var=False)
+        _t_stat, p_value = stats.ttest_ind(tasft_scores, baseline_scores, equal_var=False)
 
         # Cohen's d = (mean_tasft - mean_baseline) / pooled_std
         mean_diff = float(np.mean(tasft_scores) - np.mean(baseline_scores))

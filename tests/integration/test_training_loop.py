@@ -1,45 +1,37 @@
 """
 Integration test: full TASFT training loop.
 
-Uses a tiny GPT-2 style model (4 layers, 4 heads, 128 hidden dim)
+Uses TinyCausalLM (LLaMA-style, 4 layers, 4 heads, 16 head_dim)
 with synthetic data. Tests the complete co-training pipeline.
 
-No GPU required: runs on CPU. Uses --no-cuda flag.
+No GPU required: runs on CPU.
 Timeout: 60s per test.
 """
 from __future__ import annotations
 
 import json
-from pathlib import Path
+from typing import TYPE_CHECKING
 
 import pytest
 import torch
-import torch.nn as nn
+from torch import nn
 from torch.utils.data import Dataset
-from transformers import GPT2Config, GPT2LMHeadModel
 
-from tasft.modules import AttnGate, GateConfig, TASFTAttention, patch_model_attention
+from tasft.modules import GateConfig, TASFTAttention, patch_model_attention
 from tasft.training import TASFTTrainer, TASFTTrainingArguments
-from tasft.training.objectives import TASFTObjective
-from tasft.training.layer_rotation import LayerRotationScheduler, RotationStrategy
 
+if TYPE_CHECKING:
+    from pathlib import Path
 
-TINY_CONFIG = GPT2Config(
-    n_layer=4,
-    n_head=4,
-    n_embd=128,
-    n_positions=128,
-    vocab_size=256,
-    attn_pdrop=0.0,
-    resid_pdrop=0.0,
-    embd_pdrop=0.0,
-)
+    from tests.integration.conftest import TinyCausalLM
 
 
 class SyntheticDS(Dataset):
     """50 samples of random token sequences for integration testing."""
 
-    def __init__(self, num_samples: int = 50, seq_len: int = 128, vocab_size: int = 256) -> None:
+    def __init__(
+        self, num_samples: int = 50, seq_len: int = 64, vocab_size: int = 128,
+    ) -> None:
         torch.manual_seed(99)
         self._input_ids = torch.randint(0, vocab_size, (num_samples, seq_len))
         self._labels = self._input_ids.clone()
@@ -57,29 +49,27 @@ class SyntheticDS(Dataset):
 
 
 @pytest.fixture
-def tiny_model() -> GPT2LMHeadModel:
-    torch.manual_seed(42)
-    return GPT2LMHeadModel(TINY_CONFIG)
-
-
-@pytest.fixture
 def synthetic_dataset() -> SyntheticDS:
     return SyntheticDS()
 
 
-@pytest.fixture
-def gate_config() -> GateConfig:
-    return GateConfig(block_size=8, num_layers=4, gate_hidden_dim=8, default_threshold=0.5)
+def _freeze_and_patch(
+    model: nn.Module, gate_config: GateConfig,
+) -> dict[int, TASFTAttention]:
+    """Freeze all base params and patch attention with gates."""
+    for p in model.parameters():
+        p.requires_grad = False
+    return patch_model_attention(model, gate_config)
 
 
 def _patch_and_build_trainer(
-    model: GPT2LMHeadModel,
+    model: TinyCausalLM,
     gate_config: GateConfig,
     args: TASFTTrainingArguments,
     train_dataset: Dataset,
 ) -> tuple[TASFTTrainer, dict[int, TASFTAttention]]:
-    """Patch model and create trainer with correct API — returns (trainer, patched_layers)."""
-    patched_layers = patch_model_attention(model, gate_config)
+    """Patch model and create trainer — returns (trainer, patched_layers)."""
+    patched_layers = _freeze_and_patch(model, gate_config)
     trainer = TASFTTrainer(
         model=model,
         args=args,
@@ -103,9 +93,9 @@ def _make_training_args(tmp_path: Path, **overrides: object) -> TASFTTrainingArg
         "gate_lr_ratio": 0.1,
         "gate_warmup_steps": 3,
         "layers_per_step": 2,
-        "block_size": 8,
+        "block_size": 32,
         "rotation_strategy": "round_robin",
-        "no_cuda": True,
+        "use_cpu": True,
         "dataloader_num_workers": 0,
         "save_steps": 20,
         "logging_steps": 1,
@@ -118,9 +108,9 @@ def _make_training_args(tmp_path: Path, **overrides: object) -> TASFTTrainingArg
 @pytest.mark.integration
 @pytest.mark.timeout(60)
 def test_full_training_loop_loss_decreases(
-    tiny_model: GPT2LMHeadModel,
-    synthetic_dataset: SyntheticDS,
+    tiny_model: TinyCausalLM,
     gate_config: GateConfig,
+    synthetic_dataset: SyntheticDS,
     tmp_path: Path,
 ) -> None:
     """Full co-training loop: loss must decrease over 10 steps."""
@@ -143,9 +133,9 @@ def test_full_training_loop_loss_decreases(
 @pytest.mark.integration
 @pytest.mark.timeout(60)
 def test_base_weights_unchanged_after_training(
-    tiny_model: GPT2LMHeadModel,
-    synthetic_dataset: SyntheticDS,
+    tiny_model: TinyCausalLM,
     gate_config: GateConfig,
+    synthetic_dataset: SyntheticDS,
     tmp_path: Path,
 ) -> None:
     """Base model weights must be byte-identical before and after training.
@@ -153,12 +143,12 @@ def test_base_weights_unchanged_after_training(
     After patch_model_attention, all non-gate params have requires_grad=False.
     Training must not modify these frozen parameters.
     """
-    # Snapshot frozen params before patching (all params are base at this point)
+    # Snapshot all params before patching
     pre_patch_snapshot: dict[str, torch.Tensor] = {}
     for name, param in tiny_model.named_parameters():
         pre_patch_snapshot[name] = param.data.clone()
 
-    patched_layers = patch_model_attention(tiny_model, gate_config)
+    patched_layers = _freeze_and_patch(tiny_model, gate_config)
 
     # Identify which params are now frozen (non-gate)
     gate_param_ids = set()
@@ -192,9 +182,9 @@ def test_base_weights_unchanged_after_training(
 @pytest.mark.integration
 @pytest.mark.timeout(60)
 def test_layer_rotation_observed_in_training(
-    tiny_model: GPT2LMHeadModel,
-    synthetic_dataset: SyntheticDS,
+    tiny_model: TinyCausalLM,
     gate_config: GateConfig,
+    synthetic_dataset: SyntheticDS,
     tmp_path: Path,
 ) -> None:
     """Verify rotation scheduler cycles through layers — not all layers every step.
@@ -203,7 +193,7 @@ def test_layer_rotation_observed_in_training(
     Over 10 steps with round_robin, all 4 layers should eventually be covered.
     """
     args = _make_training_args(tmp_path, layers_per_step=2)
-    patched_layers = patch_model_attention(tiny_model, gate_config)
+    patched_layers = _freeze_and_patch(tiny_model, gate_config)
 
     trainer = TASFTTrainer(
         model=tiny_model,
@@ -211,18 +201,12 @@ def test_layer_rotation_observed_in_training(
         patched_layers=patched_layers,
         train_dataset=synthetic_dataset,
     )
-
-    # The rotation scheduler is internal to the trainer. After training,
-    # verify coverage stats show all layers were calibrated.
     trainer.train()
 
     coverage = trainer._rotation_scheduler.get_coverage_stats()
-    # After 10 steps with layers_per_step=2 and 4 layers (round_robin),
-    # every layer should have been calibrated at least once
     assert coverage.fully_covered, (
         f"Not all layers were calibrated. Coverage histogram: {coverage.coverage_histogram}"
     )
-    # Max gap should be bounded: with 4 layers and 2 per step, full cycle = 2 steps
     assert coverage.max_gap <= 5, (
         f"Layer rotation gap too large: max_gap={coverage.max_gap}"
     )
@@ -231,18 +215,14 @@ def test_layer_rotation_observed_in_training(
 @pytest.mark.integration
 @pytest.mark.timeout(60)
 def test_checkpoint_saves_three_artifacts(
-    tiny_model: GPT2LMHeadModel,
-    synthetic_dataset: SyntheticDS,
+    tiny_model: TinyCausalLM,
     gate_config: GateConfig,
+    synthetic_dataset: SyntheticDS,
     tmp_path: Path,
 ) -> None:
-    """Checkpoint must contain LoRA weights, gate weights, and sparsity profile."""
-    args = _make_training_args(
-        tmp_path,
-        max_steps=5,
-        save_steps=5,
-    )
-    patched_layers = patch_model_attention(tiny_model, gate_config)
+    """Checkpoint must contain gate weights and sparsity profile."""
+    args = _make_training_args(tmp_path, max_steps=5, save_steps=5)
+    patched_layers = _freeze_and_patch(tiny_model, gate_config)
 
     trainer = TASFTTrainer(
         model=tiny_model,
@@ -280,15 +260,18 @@ def test_checkpoint_saves_three_artifacts(
 @pytest.mark.integration
 @pytest.mark.timeout(90)
 def test_checkpoint_resume_continuity(
-    synthetic_dataset: SyntheticDS,
     gate_config: GateConfig,
+    synthetic_dataset: SyntheticDS,
+    tiny_model_config: dict[str, int],
     tmp_path: Path,
 ) -> None:
     """Training resumed from checkpoint must continue from correct step."""
+    from tests.integration.conftest import TinyCausalLM as _TinyCausalLM
+
     # First run: 5 steps with checkpoint at step 5
-    model1 = GPT2LMHeadModel(TINY_CONFIG)
     torch.manual_seed(42)
-    patched1 = patch_model_attention(model1, gate_config)
+    model1 = _TinyCausalLM(**tiny_model_config)
+    patched1 = _freeze_and_patch(model1, gate_config)
 
     args_first = _make_training_args(
         tmp_path,
@@ -297,11 +280,8 @@ def test_checkpoint_resume_continuity(
         save_steps=5,
         seed=42,
     )
-
     trainer1 = TASFTTrainer(
-        model=model1,
-        args=args_first,
-        patched_layers=patched1,
+        model=model1, args=args_first, patched_layers=patched1,
         train_dataset=synthetic_dataset,
     )
     trainer1.train()
@@ -310,9 +290,9 @@ def test_checkpoint_resume_continuity(
     assert len(checkpoint) == 1, "Expected checkpoint-5 to exist"
 
     # Second run: resume from checkpoint, train to step 10
-    model2 = GPT2LMHeadModel(TINY_CONFIG)
     torch.manual_seed(42)
-    patched2 = patch_model_attention(model2, gate_config)
+    model2 = _TinyCausalLM(**tiny_model_config)
+    patched2 = _freeze_and_patch(model2, gate_config)
 
     args_resume = _make_training_args(
         tmp_path,
@@ -321,16 +301,12 @@ def test_checkpoint_resume_continuity(
         save_steps=20,
         seed=42,
     )
-
     trainer2 = TASFTTrainer(
-        model=model2,
-        args=args_resume,
-        patched_layers=patched2,
+        model=model2, args=args_resume, patched_layers=patched2,
         train_dataset=synthetic_dataset,
     )
     trainer2.train(resume_from_checkpoint=str(checkpoint[0]))
 
-    # Verify resumed at step 5, trained to step 10
     assert trainer2.state.global_step == 10, (
         f"Expected 10 steps total, got {trainer2.state.global_step}"
     )
@@ -339,13 +315,13 @@ def test_checkpoint_resume_continuity(
 @pytest.mark.integration
 @pytest.mark.timeout(60)
 def test_gate_parameters_change_during_training(
-    tiny_model: GPT2LMHeadModel,
-    synthetic_dataset: SyntheticDS,
+    tiny_model: TinyCausalLM,
     gate_config: GateConfig,
+    synthetic_dataset: SyntheticDS,
     tmp_path: Path,
 ) -> None:
     """Gate parameters must actually change during training — gradients flow."""
-    patched_layers = patch_model_attention(tiny_model, gate_config)
+    patched_layers = _freeze_and_patch(tiny_model, gate_config)
 
     # Snapshot gate params before training
     gate_snapshots: dict[str, torch.Tensor] = {}
@@ -362,7 +338,6 @@ def test_gate_parameters_change_during_training(
     )
     trainer.train()
 
-    # At least some gate params should have changed
     changed_count = 0
     for idx, tasft_attn in patched_layers.items():
         for name, param in tasft_attn.gate.named_parameters():

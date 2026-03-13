@@ -9,9 +9,8 @@ All metrics are prefixed with `tasft_` for namespace isolation.
 from __future__ import annotations
 
 import time
-from collections.abc import Generator
 from contextlib import contextmanager
-from typing import Any
+from typing import TYPE_CHECKING, Any, Self
 
 from prometheus_client import (
     CollectorRegistry,
@@ -20,6 +19,9 @@ from prometheus_client import (
     Histogram,
     push_to_gateway,
 )
+
+if TYPE_CHECKING:
+    from collections.abc import Generator
 
 
 class TASFTMetrics:
@@ -236,7 +238,7 @@ class MetricsContext:
         self._on_complete = on_complete
         self._start_ns: int = 0
 
-    def __enter__(self) -> MetricsContext:
+    def __enter__(self) -> Self:
         self._start_ns = time.perf_counter_ns()
         return self
 

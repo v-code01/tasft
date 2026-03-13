@@ -29,26 +29,26 @@ from __future__ import annotations
 import hashlib
 import json
 import statistics
-import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Optional
+from typing import TYPE_CHECKING, Any
 
 import torch
-import torch.nn as nn
 from safetensors.torch import load_file
+from torch import nn
 from transformers import (
     AutoModelForCausalLM,
-    AutoTokenizer,
     PreTrainedModel,
 )
-from transformers.modeling_outputs import CausalLMOutputWithPast
 
 from tasft.exceptions import BundleError, ChecksumError, InferenceError
 from tasft.kernels.kernel_config import KernelConfig
 from tasft.modules.attn_gate import AttnGate, GateOutput
 from tasft.observability.logging import get_logger, timed_operation
 from tasft.types import LayerIndex, SparsityProfile, SparsityRatio
+
+if TYPE_CHECKING:
+    from transformers.modeling_outputs import CausalLMOutputWithPast
 
 logger = get_logger("tasft.inference.tasft_model")
 
@@ -103,8 +103,9 @@ def _verify_checksum(path: Path, expected_sha256: str) -> None:
             sha256.update(chunk)
     actual = sha256.hexdigest()
     if actual != expected_sha256:
+        msg = f"Checksum mismatch for {path.name}"
         raise ChecksumError(
-            f"Checksum mismatch for {path.name}",
+            msg,
             context={"expected": expected_sha256, "actual": actual, "path": str(path)},
         )
 
@@ -130,15 +131,16 @@ def _extract_attention_layers(model: PreTrainedModel) -> list[nn.Module]:
     Complexity: O(N) where N = total number of modules in model.
     """
     attn_layers: list[nn.Module] = []
-    for name, module in model.named_modules():
+    for _name, module in model.named_modules():
         cls_name = type(module).__name__
         # Match common HF attention module naming: LlamaAttention, MistralAttention, etc.
         if cls_name.endswith("Attention") and hasattr(module, "q_proj"):
             attn_layers.append(module)
 
     if not attn_layers:
+        msg = "No attention layers found in model — unsupported architecture"
         raise InferenceError(
-            "No attention layers found in model — unsupported architecture",
+            msg,
             context={"model_class": type(model).__name__},
         )
 
@@ -245,12 +247,12 @@ class _SparseAttentionWrapper(nn.Module):
         if position_embeddings is not None:
             cos, sin = position_embeddings
             query_states, key_states = _apply_rotary_pos_emb(
-                query_states, key_states, cos, sin
+                query_states, key_states, cos, sin,
             )
         elif hasattr(attn, "rotary_emb") and position_ids is not None:
             cos, sin = attn.rotary_emb(value_states, position_ids)
             query_states, key_states = _apply_rotary_pos_emb(
-                query_states, key_states, cos, sin
+                query_states, key_states, cos, sin,
             )
 
         # Handle GQA: expand KV heads to match Q heads
@@ -264,7 +266,7 @@ class _SparseAttentionWrapper(nn.Module):
             if hasattr(past_key_value, "update"):
                 # HF DynamicCache interface
                 key_states, value_states = past_key_value.update(
-                    key_states, value_states, self.layer_idx
+                    key_states, value_states, self.layer_idx,
                 )
             else:
                 # Legacy tuple cache
@@ -436,16 +438,18 @@ class TASFTInferenceModel(nn.Module):
         """
         bundle_dir = Path(bundle_path)
         if not bundle_dir.is_dir():
+            msg = f"Bundle directory does not exist: {bundle_dir}"
             raise BundleError(
-                f"Bundle directory does not exist: {bundle_dir}",
+                msg,
                 context={"path": str(bundle_dir)},
             )
 
         # Step 1: Read manifest
         manifest_path = bundle_dir / "manifest.json"
         if not manifest_path.exists():
+            msg = "manifest.json not found in bundle"
             raise BundleError(
-                "manifest.json not found in bundle",
+                msg,
                 context={"bundle_path": str(bundle_dir)},
             )
 
@@ -462,8 +466,9 @@ class TASFTInferenceModel(nn.Module):
         # Step 2: Verify SHA-256 checksums for ALL files
         checksums: dict[str, str] = manifest.get("checksums", {})
         if not checksums:
+            msg = "No checksums found in manifest"
             raise BundleError(
-                "No checksums found in manifest",
+                msg,
                 context={"bundle_path": str(bundle_dir)},
             )
 
@@ -471,8 +476,9 @@ class TASFTInferenceModel(nn.Module):
             for relative_path, expected_hash in checksums.items():
                 file_path = bundle_dir / relative_path
                 if not file_path.exists():
+                    msg = f"File listed in manifest not found: {relative_path}"
                     raise BundleError(
-                        f"File listed in manifest not found: {relative_path}",
+                        msg,
                         context={
                             "relative_path": relative_path,
                             "bundle_path": str(bundle_dir),
@@ -483,8 +489,9 @@ class TASFTInferenceModel(nn.Module):
         # Step 3: Load base model with merged LoRA weights
         model_dir = bundle_dir / "model"
         if not model_dir.is_dir():
+            msg = "model/ subdirectory not found in bundle"
             raise BundleError(
-                "model/ subdirectory not found in bundle",
+                msg,
                 context={"bundle_path": str(bundle_dir)},
             )
 
@@ -503,8 +510,9 @@ class TASFTInferenceModel(nn.Module):
         # Step 4: Load per-layer AttnGate state_dicts
         gates_dir = bundle_dir / "gates"
         if not gates_dir.is_dir():
+            msg = "gates/ subdirectory not found in bundle"
             raise BundleError(
-                "gates/ subdirectory not found in bundle",
+                msg,
                 context={"bundle_path": str(bundle_dir)},
             )
 
@@ -512,8 +520,9 @@ class TASFTInferenceModel(nn.Module):
         # Load and validate KernelConfig
         kernel_config_path = bundle_dir / "kernel_config.json"
         if not kernel_config_path.exists():
+            msg = "kernel_config.json not found in bundle"
             raise BundleError(
-                "kernel_config.json not found in bundle",
+                msg,
                 context={"bundle_path": str(bundle_dir)},
             )
 
@@ -536,8 +545,9 @@ class TASFTInferenceModel(nn.Module):
             for layer_idx in range(num_layers):
                 gate_file = gates_dir / f"layer_{layer_idx}_gate.safetensors"
                 if not gate_file.exists():
+                    msg = f"Gate file not found for layer {layer_idx}"
                     raise BundleError(
-                        f"Gate file not found for layer {layer_idx}",
+                        msg,
                         context={
                             "layer_idx": layer_idx,
                             "expected_path": str(gate_file),
@@ -661,14 +671,16 @@ class TASFTInferenceModel(nn.Module):
         Complexity: O((num_warmup + num_timed) * forward_cost).
         """
         if not torch.cuda.is_available():
+            msg = "CUDA required for benchmarking"
             raise InferenceError(
-                "CUDA required for benchmarking",
+                msg,
                 context={"cuda_available": False},
             )
 
         if num_timed < 1:
+            msg = "num_timed must be >= 1"
             raise InferenceError(
-                "num_timed must be >= 1",
+                msg,
                 context={"num_timed": num_timed},
             )
 
@@ -765,7 +777,7 @@ class TASFTInferenceModel(nn.Module):
         for wrapper in self._sparse_wrappers:
             if wrapper.last_gate_output is not None:
                 profile[LayerIndex(wrapper.layer_idx)] = SparsityRatio(
-                    wrapper.last_gate_output.sparsity_ratio
+                    wrapper.last_gate_output.sparsity_ratio,
                 )
 
         return profile
@@ -793,14 +805,15 @@ def _replace_attention_module(
 
     Complexity: O(N) where N = total number of modules.
     """
-    for name, module in model.named_modules():
+    for _name, module in model.named_modules():
         for child_name, child in module.named_children():
             if child is target:
                 setattr(module, child_name, replacement)
                 return
 
+    msg = "Could not find target attention module in model for replacement"
     raise InferenceError(
-        "Could not find target attention module in model for replacement",
+        msg,
         context={"target_type": type(target).__name__},
     )
 

@@ -19,13 +19,12 @@ import json
 import shutil
 import tempfile
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
-from typing import Optional
+from typing import TYPE_CHECKING
 
 import torch
-from peft import PeftModel
-from safetensors.torch import load_file, save_file
+from safetensors.torch import save_file
 
 from tasft.bundle.bundle_schema import (
     BundleManifest,
@@ -34,9 +33,12 @@ from tasft.bundle.bundle_schema import (
     KernelConfig,
     LayerKernelConfig,
 )
-from tasft.exceptions import BundleError, ChecksumError
+from tasft.exceptions import BundleError
 from tasft.modules.attn_gate import AttnGate
 from tasft.observability.logging import get_logger, timed_operation
+
+if TYPE_CHECKING:
+    from peft import PeftModel
 
 _log = get_logger("tasft.bundle.export")
 
@@ -104,13 +106,15 @@ class BundleExporter:
             BundleError: If config values are invalid.
         """
         if config.block_size <= 0:
+            msg = "block_size must be positive"
             raise BundleError(
-                "block_size must be positive",
+                msg,
                 context={"block_size": config.block_size},
             )
         if not 0.0 < config.global_threshold < 1.0:
+            msg = "global_threshold must be in (0, 1)"
             raise BundleError(
-                "global_threshold must be in (0, 1)",
+                msg,
                 context={"global_threshold": config.global_threshold},
             )
         self.config = config
@@ -119,7 +123,7 @@ class BundleExporter:
         self,
         model: PeftModel,
         output_dir: str | Path,
-        eval_results: Optional[EvalSummary] = None,
+        eval_results: EvalSummary | None = None,
         git_hash: str = "unknown",
     ) -> Path:
         """Export TASFT bundle atomically.
@@ -145,14 +149,15 @@ class BundleExporter:
         """
         output_dir = Path(output_dir)
         if output_dir.exists():
-            raise FileExistsError(f"Bundle output dir already exists: {output_dir}")
+            msg = f"Bundle output dir already exists: {output_dir}"
+            raise FileExistsError(msg)
 
         # Ensure parent directory exists for temp dir creation
         output_dir.parent.mkdir(parents=True, exist_ok=True)
 
         # Write to temp dir, then rename atomically
         tmp_dir = Path(
-            tempfile.mkdtemp(dir=output_dir.parent, prefix=".tasft_bundle_tmp_")
+            tempfile.mkdtemp(dir=output_dir.parent, prefix=".tasft_bundle_tmp_"),
         )
         try:
             with timed_operation(_log, "bundle_export", model_name=self.config.model_name):
@@ -162,8 +167,9 @@ class BundleExporter:
                 validation_result = self.validate_bundle(tmp_dir)
 
             if not validation_result.is_valid:
+                msg = "Bundle validation failed after export"
                 raise BundleError(
-                    "Bundle validation failed after export",
+                    msg,
                     context={"errors": validation_result.errors},
                 )
 
@@ -188,7 +194,7 @@ class BundleExporter:
         self,
         model: PeftModel,
         tmp_dir: Path,
-        eval_results: Optional[EvalSummary],
+        eval_results: EvalSummary | None,
         git_hash: str,
     ) -> None:
         """Write all bundle artifacts to the given directory.
@@ -244,7 +250,7 @@ class BundleExporter:
         # 6. Build KernelConfig from sparsity profile
         kernel_config = self._build_kernel_config(sparsity_profile)
         (tmp_dir / "kernel_config.json").write_text(
-            kernel_config.model_dump_json(indent=2)
+            kernel_config.model_dump_json(indent=2),
         )
 
         # 7. Compute checksums for all serialized files using relative paths from bundle root
@@ -266,7 +272,7 @@ class BundleExporter:
             model_name=self.config.model_name,
             base_model_id=self.config.base_model_id,
             domain=self.config.domain,
-            created_at=datetime.now(timezone.utc),
+            created_at=datetime.now(UTC),
             git_hash=git_hash,
             training_args_hash=training_args_hash,
             checksums=checksums,
@@ -278,7 +284,7 @@ class BundleExporter:
         # 10. Write eval results if provided
         if eval_results is not None:
             (tmp_dir / "eval_results.json").write_text(
-                eval_results.model_dump_json(indent=2)
+                eval_results.model_dump_json(indent=2),
             )
 
     @staticmethod
@@ -311,8 +317,9 @@ class BundleExporter:
                     gates[layer_idx] = module
 
         if not gates:
+            msg = "No AttnGate modules found in model. Is this a TASFT-trained model?"
             raise BundleError(
-                "No AttnGate modules found in model. Is this a TASFT-trained model?",
+                msg,
                 context={"model_type": type(model).__name__},
             )
 
@@ -353,7 +360,7 @@ class BundleExporter:
         return profile
 
     def _build_kernel_config(
-        self, sparsity_profile: dict[int, tuple[float, float]]
+        self, sparsity_profile: dict[int, tuple[float, float]],
     ) -> KernelConfig:
         """Build KernelConfig from per-layer sparsity profile.
 
@@ -458,7 +465,7 @@ class BundleExporter:
         if not manifest_path.exists():
             errors.append("manifest.json not found")
             return ValidationResult(
-                is_valid=False, errors=errors, warnings=warnings, checked_files=0
+                is_valid=False, errors=errors, warnings=warnings, checked_files=0,
             )
 
         try:
@@ -467,7 +474,7 @@ class BundleExporter:
         except (json.JSONDecodeError, Exception) as exc:
             errors.append(f"Invalid manifest.json: {exc}")
             return ValidationResult(
-                is_valid=False, errors=errors, warnings=warnings, checked_files=0
+                is_valid=False, errors=errors, warnings=warnings, checked_files=0,
             )
 
         # Check kernel_config exists and is valid
@@ -493,7 +500,7 @@ class BundleExporter:
             if actual_checksum != expected_checksum:
                 errors.append(
                     f"Checksum mismatch for {relative_path}: "
-                    f"expected {expected_checksum[:16]}..., got {actual_checksum[:16]}..."
+                    f"expected {expected_checksum[:16]}..., got {actual_checksum[:16]}...",
                 )
             checked_files += 1
 
@@ -503,7 +510,8 @@ class BundleExporter:
             gate_files = sorted(gates_dir.iterdir())
             if len(gate_files) != manifest.num_layers:
                 warnings.append(
-                    f"Gate file count ({len(gate_files)}) != manifest num_layers ({manifest.num_layers})"
+                    f"Gate file count ({len(gate_files)}) != "
+                    f"manifest num_layers ({manifest.num_layers})",
                 )
 
         # Check model directory has weights
@@ -550,33 +558,37 @@ class BundleExporter:
 
         manifest_path = bundle_path / "manifest.json"
         if not manifest_path.exists():
+            msg = "manifest.json not found in bundle"
             raise BundleError(
-                "manifest.json not found in bundle",
+                msg,
                 context={"bundle_path": str(bundle_path)},
             )
 
         try:
             manifest = BundleManifest.model_validate_json(manifest_path.read_text())
         except Exception as exc:
+            msg = f"Failed to parse manifest.json: {exc}"
             raise BundleError(
-                f"Failed to parse manifest.json: {exc}",
+                msg,
                 context={"bundle_path": str(bundle_path)},
             ) from exc
 
         kernel_config_path = bundle_path / "kernel_config.json"
         if not kernel_config_path.exists():
+            msg = "kernel_config.json not found in bundle"
             raise BundleError(
-                "kernel_config.json not found in bundle",
+                msg,
                 context={"bundle_path": str(bundle_path)},
             )
 
         try:
             kernel_config = KernelConfig.model_validate_json(
-                kernel_config_path.read_text()
+                kernel_config_path.read_text(),
             )
         except Exception as exc:
+            msg = f"Failed to parse kernel_config.json: {exc}"
             raise BundleError(
-                f"Failed to parse kernel_config.json: {exc}",
+                msg,
                 context={"bundle_path": str(bundle_path)},
             ) from exc
 

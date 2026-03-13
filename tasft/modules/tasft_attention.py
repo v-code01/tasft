@@ -20,13 +20,12 @@ Complexity: Training adds O((S/B)^2) gate overhead per layer.
 """
 from __future__ import annotations
 
-import math
-from dataclasses import dataclass, field
-from typing import Any, Optional, Sequence
+from dataclasses import dataclass
+from typing import Any
 
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
+from torch import nn
 
 from tasft.exceptions import ValidationError
 from tasft.modules.attn_gate import AttnGate, GateOutput
@@ -51,24 +50,27 @@ class GateConfig:
 
     block_size: int = 64
     num_layers: int = 32
-    gate_hidden_dim: Optional[int] = None
+    gate_hidden_dim: int | None = None
     default_threshold: float = 0.5
 
     def __post_init__(self) -> None:
         """Validate configuration values."""
         if self.block_size <= 0:
+            msg = f"block_size must be positive, got {self.block_size}"
             raise ValidationError(
-                f"block_size must be positive, got {self.block_size}",
+                msg,
                 context={"block_size": self.block_size},
             )
         if self.num_layers <= 0:
+            msg = f"num_layers must be positive, got {self.num_layers}"
             raise ValidationError(
-                f"num_layers must be positive, got {self.num_layers}",
+                msg,
                 context={"num_layers": self.num_layers},
             )
         if not 0.0 <= self.default_threshold <= 1.0:
+            msg = f"default_threshold must be in [0, 1], got {self.default_threshold}"
             raise ValidationError(
-                f"default_threshold must be in [0, 1], got {self.default_threshold}",
+                msg,
                 context={"default_threshold": self.default_threshold},
             )
 
@@ -87,9 +89,9 @@ class TASFTAttentionOutput:
     """
 
     hidden_states: HiddenStates
-    attn_weights: Optional[AttentionScores]
-    gate_output: Optional[GateOutput]
-    gate_target_scores: Optional[BlockImportance]
+    attn_weights: AttentionScores | None
+    gate_output: GateOutput | None
+    gate_target_scores: BlockImportance | None
     layer_idx: LayerIndex
 
 
@@ -139,6 +141,11 @@ class TASFTAttention(nn.Module):
         self.gate = gate
         self.layer_idx = layer_idx
         self.compute_gate_target = compute_gate_target
+
+        # Mutable instance attributes for trainer extraction after forward pass.
+        # Set during forward(), read by TASFTTrainer._extract_gate_output/attn_scores.
+        self._last_gate_output: GateOutput | None = None
+        self._last_attn_weights: AttentionScores | None = None
 
     def set_training_mode(self, compute_gate_target: bool) -> None:
         """Toggle gate target computation for training vs inference.
@@ -199,34 +206,38 @@ class TASFTAttention(nn.Module):
         # Softmax-normalize over flattened block dim for distillation target
         flat = block_max.reshape(B, H, NB_q * NB_k)
         flat_softmax = F.softmax(flat, dim=-1)
-        target = flat_softmax.reshape(B, H, NB_q, NB_k)
+        return flat_softmax.reshape(B, H, NB_q, NB_k)
 
-        return target
 
     def forward(
         self,
         hidden_states: torch.Tensor,
-        attention_mask: Optional[torch.Tensor] = None,
-        position_ids: Optional[torch.Tensor] = None,
-        past_key_value: Optional[Any] = None,
+        attention_mask: torch.Tensor | None = None,
+        position_ids: torch.Tensor | None = None,
+        past_key_value: Any | None = None,
         output_attentions: bool = False,
         use_cache: bool = False,
-        cache_position: Optional[torch.Tensor] = None,
-        position_embeddings: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
+        cache_position: torch.Tensor | None = None,
+        position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None,
         **kwargs: Any,
-    ) -> TASFTAttentionOutput:
+    ) -> tuple[torch.Tensor, ...]:
         """Forward pass dispatching training vs inference paths.
+
+        Returns HF-compatible tuple: (attn_output, attn_weights_or_None, past_kv_or_None).
+        Gate data is stored as instance attributes for trainer extraction:
+            self._last_gate_output: GateOutput from AttnGate
+            self._last_attn_weights: Full attention scores [B, H, S, S]
 
         Training path (grad enabled + compute_gate_target):
             1. Run full base attention with output_attentions=True
             2. Run AttnGate(Q, K) for predicted block scores
             3. Compute gate target from full attention scores
-            4. Return all aux data for loss computation
+            4. Store aux data as instance attributes
 
         Inference path (no grad or compute_gate_target=False):
             1. Run AttnGate(Q, K) for hard block mask
             2. Run base attention (mask could be applied externally for sparse kernels)
-            3. Return hidden_states + gate_output
+            3. Store gate_output as instance attribute
 
         Args:
             hidden_states: Input hidden states [B, S, hidden_dim].
@@ -240,7 +251,7 @@ class TASFTAttention(nn.Module):
             **kwargs: Additional arguments forwarded to base attention.
 
         Returns:
-            TASFTAttentionOutput with hidden_states and optional aux data.
+            Tuple (attn_output, attn_weights, past_key_value) — standard HF convention.
         """
         is_training = torch.is_grad_enabled() and self.compute_gate_target
 
@@ -269,19 +280,24 @@ class TASFTAttention(nn.Module):
     def _training_forward(
         self,
         hidden_states: torch.Tensor,
-        attention_mask: Optional[torch.Tensor] = None,
-        position_ids: Optional[torch.Tensor] = None,
-        past_key_value: Optional[Any] = None,
+        attention_mask: torch.Tensor | None = None,
+        position_ids: torch.Tensor | None = None,
+        past_key_value: Any | None = None,
         use_cache: bool = False,
-        cache_position: Optional[torch.Tensor] = None,
-        position_embeddings: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
+        cache_position: torch.Tensor | None = None,
+        position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None,
         **kwargs: Any,
-    ) -> TASFTAttentionOutput:
+    ) -> tuple[torch.Tensor, ...]:
         """Training forward: full attention + gate prediction + gate target.
 
         Runs full dense attention to get both hidden_states and attention weights.
         The attention weights are used to compute the gate distillation target.
         The gate is also run on Q/K to produce predictions for the gate loss.
+
+        Stores self._last_gate_output and self._last_attn_weights for trainer extraction.
+
+        Returns:
+            HF-compatible tuple (attn_output, attn_weights, past_key_value).
         """
         # Run base attention with output_attentions=True for gate target computation
         base_output = self.base_attn(
@@ -300,54 +316,59 @@ class TASFTAttention(nn.Module):
         # (attn_output, attn_weights, [past_key_value])
         attn_output = base_output[0]
         attn_weights = base_output[1]  # [B, H, S, S]
+        past_kv = base_output[2] if len(base_output) > 2 else None
+
+        # Store attention weights for trainer extraction
+        self._last_attn_weights = attn_weights
 
         # Extract Q, K for gate input by running the projections
         # We get them from the base attention's internal state
         # For HF models, Q/K are computed inside forward. We approximate by
         # using the attention weights to derive gate targets, and run the gate
         # on a separate Q/K projection path.
-        gate_output: Optional[GateOutput] = None
-        gate_target: Optional[torch.Tensor] = None
+        gate_output: GateOutput | None = None
 
         if attn_weights is not None:
-            # Compute gate target from full attention weights
-            gate_target = self._compute_gate_target(attn_weights.detach())
-
             # Run gate on Q/K derived from hidden_states via base_attn projections
-            # We access the base attention's q_proj and k_proj to get Q, K
             q_proj, k_proj = self._extract_qk_projections(hidden_states)
             if q_proj is not None and k_proj is not None:
                 gate_output = self.gate(q_proj, k_proj)
 
-        return TASFTAttentionOutput(
-            hidden_states=attn_output,
-            attn_weights=attn_weights,
-            gate_output=gate_output,
-            gate_target_scores=gate_target,
-            layer_idx=self.layer_idx,
-        )
+        # Store gate output for trainer extraction
+        self._last_gate_output = gate_output
+
+        return (attn_output, attn_weights, past_kv)
 
     def _inference_forward(
         self,
         hidden_states: torch.Tensor,
-        attention_mask: Optional[torch.Tensor] = None,
-        position_ids: Optional[torch.Tensor] = None,
-        past_key_value: Optional[Any] = None,
+        attention_mask: torch.Tensor | None = None,
+        position_ids: torch.Tensor | None = None,
+        past_key_value: Any | None = None,
         use_cache: bool = False,
-        cache_position: Optional[torch.Tensor] = None,
-        position_embeddings: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
+        cache_position: torch.Tensor | None = None,
+        position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None,
         **kwargs: Any,
-    ) -> TASFTAttentionOutput:
+    ) -> tuple[torch.Tensor, ...]:
         """Inference forward: gate prediction + base attention (sparse path ready).
 
         Runs the gate first to predict block importance, then runs base attention.
         The gate output can be used by a sparse attention kernel to skip unimportant blocks.
+
+        Stores self._last_gate_output for trainer extraction.
+
+        Returns:
+            HF-compatible tuple (attn_output, None, past_key_value).
         """
         # Try to extract Q, K for gate prediction
-        gate_output: Optional[GateOutput] = None
+        gate_output: GateOutput | None = None
         q_proj, k_proj = self._extract_qk_projections(hidden_states)
         if q_proj is not None and k_proj is not None:
             gate_output = self.gate(q_proj, k_proj)
+
+        # Store gate output for trainer extraction
+        self._last_gate_output = gate_output
+        self._last_attn_weights = None
 
         # Run base attention (future: integrate sparse mask from gate_output)
         base_output = self.base_attn(
@@ -363,18 +384,13 @@ class TASFTAttention(nn.Module):
         )
 
         attn_output = base_output[0]
+        past_kv = base_output[2] if len(base_output) > 2 else None
 
-        return TASFTAttentionOutput(
-            hidden_states=attn_output,
-            attn_weights=None,
-            gate_output=gate_output,
-            gate_target_scores=None,
-            layer_idx=self.layer_idx,
-        )
+        return (attn_output, None, past_kv)
 
     def _extract_qk_projections(
-        self, hidden_states: torch.Tensor
-    ) -> tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+        self, hidden_states: torch.Tensor,
+    ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
         """Extract Q and K tensors from hidden_states using base attention's projections.
 
         Supports HuggingFace model architectures that expose q_proj and k_proj as attributes.
@@ -393,7 +409,6 @@ class TASFTAttention(nn.Module):
             return None, None
 
         B, S, _ = hidden_states.shape
-        num_heads = self.gate.num_heads
         head_dim = self.gate.head_dim
 
         # Project: [B, S, hidden_dim] -> [B, S, num_heads * head_dim]
@@ -457,16 +472,20 @@ def patch_model_attention(
     # Find the model's layer list
     layers = _find_model_layers(model)
     if layers is None:
-        raise ValidationError(
+        msg = (
             "Could not find transformer layers in model. "
-            "Expected model.model.layers or model.transformer.h",
+            "Expected model.model.layers or model.transformer.h"
+        )
+        raise ValidationError(
+            msg,
             context={"model_type": type(model).__name__},
         )
 
     num_layers = len(layers)
     if gate_config.num_layers > num_layers:
+        msg = f"gate_config.num_layers ({gate_config.num_layers}) > model layers ({num_layers})"
         raise ValidationError(
-            f"gate_config.num_layers ({gate_config.num_layers}) > model layers ({num_layers})",
+            msg,
             context={
                 "config_layers": gate_config.num_layers,
                 "model_layers": num_layers,
@@ -476,8 +495,9 @@ def patch_model_attention(
     # Determine num_heads and head_dim from the first attention module
     first_attn = _find_attn_module(layers[0])
     if first_attn is None:
+        msg = "Could not find attention module in layer 0"
         raise ValidationError(
-            "Could not find attention module in layer 0",
+            msg,
             context={"layer_type": type(layers[0]).__name__},
         )
 
@@ -489,8 +509,9 @@ def patch_model_attention(
         layer = layers[idx]
         base_attn = _find_attn_module(layer)
         if base_attn is None:
+            msg = f"Could not find attention module in layer {idx}"
             raise ValidationError(
-                f"Could not find attention module in layer {idx}",
+                msg,
                 context={"layer_idx": idx, "layer_type": type(layer).__name__},
             )
 
@@ -530,7 +551,7 @@ def patch_model_attention(
     return patched
 
 
-def _find_model_layers(model: nn.Module) -> Optional[nn.ModuleList]:
+def _find_model_layers(model: nn.Module) -> nn.ModuleList | None:
     """Find the transformer layer list in a HuggingFace model.
 
     Supports: model.model.layers (LLaMA, Mistral, Qwen2)
@@ -562,7 +583,7 @@ def _find_model_layers(model: nn.Module) -> Optional[nn.ModuleList]:
     return None
 
 
-def _find_attn_module(layer: nn.Module) -> Optional[nn.Module]:
+def _find_attn_module(layer: nn.Module) -> nn.Module | None:
     """Find the attention module within a transformer layer.
 
     Supports: layer.self_attn (LLaMA, Mistral, Qwen2)
@@ -594,8 +615,9 @@ def _replace_attn_module(layer: nn.Module, replacement: nn.Module) -> None:
             setattr(layer, attr_name, replacement)
             return
 
+    msg = "Could not find attention attribute to replace"
     raise ValidationError(
-        "Could not find attention attribute to replace",
+        msg,
         context={"layer_type": type(layer).__name__},
     )
 
@@ -611,8 +633,8 @@ def _extract_attn_dims(attn: nn.Module) -> tuple[int, int]:
     Raises:
         ValidationError: If dimensions cannot be determined.
     """
-    num_heads: Optional[int] = None
-    head_dim: Optional[int] = None
+    num_heads: int | None = None
+    head_dim: int | None = None
 
     # Try common attribute names for num_heads
     for attr in ("num_heads", "num_attention_heads", "n_head"):
@@ -635,8 +657,9 @@ def _extract_attn_dims(attn: nn.Module) -> tuple[int, int]:
             head_dim = hidden_size // num_heads
 
     if num_heads is None or head_dim is None:
+        msg = "Cannot determine num_heads and head_dim from attention module"
         raise ValidationError(
-            "Cannot determine num_heads and head_dim from attention module",
+            msg,
             context={
                 "attn_type": type(attn).__name__,
                 "num_heads": num_heads,
@@ -672,8 +695,9 @@ def _verify_frozen_base(
             unfrozen_base.append(name)
 
     if unfrozen_base:
+        msg = f"Found {len(unfrozen_base)} unfrozen base parameters after patching"
         raise ValidationError(
-            f"Found {len(unfrozen_base)} unfrozen base parameters after patching",
+            msg,
             context={"unfrozen_params": unfrozen_base[:10]},  # first 10 for context
         )
 

@@ -1,7 +1,10 @@
-"""Shared type aliases for TASFT. All types must be imported from here — no redefinition elsewhere."""
+"""Shared type aliases for TASFT.
+
+All types must be imported from here -- no redefinition elsewhere.
+"""
 from __future__ import annotations
 
-from typing import Dict, NewType, TypeAlias
+from typing import NewType, TypeAlias
 
 import torch
 
@@ -16,7 +19,7 @@ LayerIndex = NewType("LayerIndex", int)
 SparsityRatio = NewType("SparsityRatio", float)  # in [0, 1]
 
 # SparsityProfile: per-layer sparsity measurements
-SparsityProfile: TypeAlias = Dict[LayerIndex, SparsityRatio]
+SparsityProfile: TypeAlias = dict[LayerIndex, SparsityRatio]
 
 __all__ = [
     "AttentionScores",

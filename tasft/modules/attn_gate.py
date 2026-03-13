@@ -17,13 +17,11 @@ Parameter count: ~0.05% of model params per layer
 """
 from __future__ import annotations
 
-import math
 from dataclasses import dataclass
-from typing import Optional
 
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
+from torch import nn
 
 from tasft.exceptions import ValidationError
 from tasft.types import BlockMask, SoftGateScores, SparsityRatio
@@ -75,7 +73,7 @@ class AttnGate(nn.Module):
         num_heads: int,
         head_dim: int,
         block_size: int = 64,
-        gate_hidden_dim: Optional[int] = None,
+        gate_hidden_dim: int | None = None,
         default_threshold: float = 0.5,
     ) -> None:
         """Initialize AttnGate.
@@ -93,23 +91,27 @@ class AttnGate(nn.Module):
         super().__init__()
 
         if num_heads <= 0:
+            msg = f"num_heads must be positive, got {num_heads}"
             raise ValidationError(
-                f"num_heads must be positive, got {num_heads}",
+                msg,
                 context={"num_heads": num_heads},
             )
         if head_dim <= 0:
+            msg = f"head_dim must be positive, got {head_dim}"
             raise ValidationError(
-                f"head_dim must be positive, got {head_dim}",
+                msg,
                 context={"head_dim": head_dim},
             )
         if block_size <= 0:
+            msg = f"block_size must be positive, got {block_size}"
             raise ValidationError(
-                f"block_size must be positive, got {block_size}",
+                msg,
                 context={"block_size": block_size},
             )
         if not 0.0 <= default_threshold <= 1.0:
+            msg = f"default_threshold must be in [0, 1], got {default_threshold}"
             raise ValidationError(
-                f"default_threshold must be in [0, 1], got {default_threshold}",
+                msg,
                 context={"default_threshold": default_threshold},
             )
 
@@ -170,7 +172,7 @@ class AttnGate(nn.Module):
         self,
         q: torch.Tensor,
         k: torch.Tensor,
-        threshold: Optional[float] = None,
+        threshold: float | None = None,
     ) -> GateOutput:
         """Predict block importance scores from Q and K tensors.
 
@@ -191,36 +193,42 @@ class AttnGate(nn.Module):
         tau = threshold if threshold is not None else self.default_threshold
 
         if q.ndim != 4:
+            msg = f"Expected 4D Q tensor [B, H, S, D], got ndim={q.ndim}"
             raise ValidationError(
-                f"Expected 4D Q tensor [B, H, S, D], got ndim={q.ndim}",
+                msg,
                 context={"q_shape": list(q.shape)},
             )
         if k.ndim != 4:
+            msg = f"Expected 4D K tensor [B, H, S, D], got ndim={k.ndim}"
             raise ValidationError(
-                f"Expected 4D K tensor [B, H, S, D], got ndim={k.ndim}",
+                msg,
                 context={"k_shape": list(k.shape)},
             )
 
         B, H, S, D = q.shape
 
         if k.shape != q.shape:
+            msg = f"Q and K must have same shape, got {q.shape} vs {k.shape}"
             raise ValidationError(
-                f"Q and K must have same shape, got {q.shape} vs {k.shape}",
+                msg,
                 context={"q_shape": list(q.shape), "k_shape": list(k.shape)},
             )
-        if H != self.num_heads:
+        if self.num_heads != H:
+            msg = f"Expected {self.num_heads} heads, got {H}"
             raise ValidationError(
-                f"Expected {self.num_heads} heads, got {H}",
+                msg,
                 context={"expected_heads": self.num_heads, "actual_heads": H},
             )
-        if D != self.head_dim:
+        if self.head_dim != D:
+            msg = f"Expected head_dim={self.head_dim}, got {D}"
             raise ValidationError(
-                f"Expected head_dim={self.head_dim}, got {D}",
+                msg,
                 context={"expected_dim": self.head_dim, "actual_dim": D},
             )
         if S == 0:
+            msg = "Sequence length must be > 0"
             raise ValidationError(
-                "Sequence length must be > 0",
+                msg,
                 context={"seq_len": S},
             )
 

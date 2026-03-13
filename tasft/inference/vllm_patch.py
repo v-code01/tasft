@@ -23,22 +23,22 @@ Complexity: O(L) for patch application where L = number of attention layers
 from __future__ import annotations
 
 import threading
-from typing import TYPE_CHECKING, Any, Optional
+from typing import TYPE_CHECKING, Any
 
 import torch
-import torch.nn as nn
+from torch import nn
 
 from tasft.exceptions import InferenceError
-from tasft.modules.attn_gate import AttnGate, GateOutput
 from tasft.observability.logging import get_logger
 
 if TYPE_CHECKING:
     from tasft.inference.tasft_model import TASFTInferenceModel
+    from tasft.modules.attn_gate import AttnGate
 
 logger = get_logger("tasft.inference.vllm_patch")
 
 _patch_lock = threading.Lock()
-_patch_applied = bool(False)
+_patch_applied = False
 
 
 class TASFTvLLMAttentionBackend(nn.Module):
@@ -109,7 +109,7 @@ class TASFTvLLMAttentionBackend(nn.Module):
         query: torch.Tensor,
         key: torch.Tensor,
         value: torch.Tensor,
-        kv_cache: Optional[torch.Tensor] = None,
+        kv_cache: torch.Tensor | None = None,
         attn_metadata: Any = None,
         kv_scale: float = 1.0,
         **kwargs: Any,
@@ -175,8 +175,7 @@ class TASFTvLLMAttentionBackend(nn.Module):
             attn_output = torch.matmul(attn_weights, v)
 
         # Reshape back to vLLM flat format: [1, H, S, D] -> [num_tokens, H*D]
-        output = attn_output.transpose(1, 2).contiguous().reshape(num_tokens, -1)
-        return output
+        return attn_output.transpose(1, 2).contiguous().reshape(num_tokens, -1)
 
     def _dense_attention_flat(
         self,
@@ -295,7 +294,7 @@ def _extract_vllm_attention_modules(worker_model: nn.Module) -> list[nn.Module]:
     Complexity: O(N) where N = total number of modules.
     """
     attn_modules: list[nn.Module] = []
-    for name, module in worker_model.named_modules():
+    for _name, module in worker_model.named_modules():
         cls_name = type(module).__name__
         # vLLM wraps attention in various classes
         if "Attention" in cls_name and (
@@ -304,8 +303,9 @@ def _extract_vllm_attention_modules(worker_model: nn.Module) -> list[nn.Module]:
             attn_modules.append(module)
 
     if not attn_modules:
+        msg = "No attention modules found in vLLM worker model"
         raise InferenceError(
-            "No attention modules found in vLLM worker model",
+            msg,
             context={"model_class": type(worker_model).__name__},
         )
 
@@ -364,8 +364,9 @@ def patch_vllm_attention(
         elif hasattr(vllm_worker, "model"):
             worker_model = vllm_worker.model
         else:
+            msg = "Cannot find model in vLLM worker — unsupported vLLM version"
             raise InferenceError(
-                "Cannot find model in vLLM worker — unsupported vLLM version",
+                msg,
                 context={"worker_type": type(vllm_worker).__name__},
             )
 
@@ -374,9 +375,12 @@ def patch_vllm_attention(
         num_tasft_layers = len(tasft_model.gates)
 
         if num_vllm_layers != num_tasft_layers:
-            raise InferenceError(
+            msg = (
                 f"Layer count mismatch: vLLM has {num_vllm_layers} attention layers "
-                f"but TASFT has {num_tasft_layers} gates",
+                f"but TASFT has {num_tasft_layers} gates"
+            )
+            raise InferenceError(
+                msg,
                 context={
                     "vllm_layers": num_vllm_layers,
                     "tasft_layers": num_tasft_layers,
@@ -396,8 +400,9 @@ def patch_vllm_attention(
             elif hasattr(vllm_attn, "num_attention_heads"):
                 num_heads = vllm_attn.num_attention_heads
             else:
+                msg = f"Cannot determine num_heads from vLLM attention module at layer {layer_idx}"
                 raise InferenceError(
-                    f"Cannot determine num_heads from vLLM attention module at layer {layer_idx}",
+                    msg,
                     context={"module_type": type(vllm_attn).__name__},
                 )
 
@@ -433,7 +438,7 @@ def patch_vllm_attention(
                     query: torch.Tensor,
                     key: torch.Tensor,
                     value: torch.Tensor,
-                    kv_cache: Optional[torch.Tensor] = None,
+                    kv_cache: torch.Tensor | None = None,
                     attn_metadata: Any = None,
                     kv_scale: float = 1.0,
                     **fwd_kwargs: Any,

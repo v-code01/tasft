@@ -13,7 +13,6 @@ Coverage target: 100% for all strategies and coverage tracking.
 import math
 
 import pytest
-import torch
 
 from tasft.training.layer_rotation import (
     CoverageStats,
@@ -22,7 +21,6 @@ from tasft.training.layer_rotation import (
     estimate_activation_memory_gb,
 )
 from tasft.types import LayerIndex
-
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -121,7 +119,7 @@ class TestRoundRobin:
 
     def test_exact_coverage_count_per_cycle(self, rr_scheduler: LayerRotationScheduler) -> None:
         """Each layer selected exactly once per full cycle for divisible case."""
-        counts: dict[int, int] = {i: 0 for i in range(8)}
+        counts: dict[int, int] = dict.fromkeys(range(8), 0)
         cycle_len = 4  # 8 layers / 2 per step
         for _ in range(cycle_len):
             active = rr_scheduler.get_active_layers()
@@ -188,34 +186,34 @@ class TestRandomStrategy:
 
     def test_returns_correct_count(self) -> None:
         s = LayerRotationScheduler(
-            num_layers=8, layers_per_step=3, strategy=RotationStrategy.RANDOM, seed=42
+            num_layers=8, layers_per_step=3, strategy=RotationStrategy.RANDOM, seed=42,
         )
         active = s.get_active_layers()
         assert len(active) == 3
 
     def test_no_duplicates(self) -> None:
         s = LayerRotationScheduler(
-            num_layers=8, layers_per_step=4, strategy=RotationStrategy.RANDOM, seed=42
+            num_layers=8, layers_per_step=4, strategy=RotationStrategy.RANDOM, seed=42,
         )
         active = s.get_active_layers()
         assert len(set(active)) == 4
 
     def test_reproducible_with_same_seed(self) -> None:
         s1 = LayerRotationScheduler(
-            num_layers=8, layers_per_step=2, strategy=RotationStrategy.RANDOM, seed=123
+            num_layers=8, layers_per_step=2, strategy=RotationStrategy.RANDOM, seed=123,
         )
         s2 = LayerRotationScheduler(
-            num_layers=8, layers_per_step=2, strategy=RotationStrategy.RANDOM, seed=123
+            num_layers=8, layers_per_step=2, strategy=RotationStrategy.RANDOM, seed=123,
         )
         for _ in range(10):
             assert s1.get_active_layers() == s2.get_active_layers()
 
     def test_different_seeds_give_different_results(self) -> None:
         s1 = LayerRotationScheduler(
-            num_layers=32, layers_per_step=2, strategy=RotationStrategy.RANDOM, seed=1
+            num_layers=32, layers_per_step=2, strategy=RotationStrategy.RANDOM, seed=1,
         )
         s2 = LayerRotationScheduler(
-            num_layers=32, layers_per_step=2, strategy=RotationStrategy.RANDOM, seed=999
+            num_layers=32, layers_per_step=2, strategy=RotationStrategy.RANDOM, seed=999,
         )
         # Over 10 steps, they should differ at least once (extremely likely with 32 layers)
         any_different = False
@@ -227,7 +225,7 @@ class TestRandomStrategy:
 
     def test_all_indices_in_valid_range(self) -> None:
         s = LayerRotationScheduler(
-            num_layers=8, layers_per_step=3, strategy=RotationStrategy.RANDOM, seed=42
+            num_layers=8, layers_per_step=3, strategy=RotationStrategy.RANDOM, seed=42,
         )
         for _ in range(20):
             active = s.get_active_layers()
@@ -259,7 +257,7 @@ class TestPriorityWeighted:
             s.report_gate_loss(i, 0.01)
         s.report_gate_loss(3, 100.0)
 
-        counts = {i: 0 for i in range(8)}
+        counts = dict.fromkeys(range(8), 0)
         num_trials = 5000
         for _ in range(num_trials):
             active = s.get_active_layers()
@@ -280,13 +278,13 @@ class TestPriorityWeighted:
         assert len(set(active)) == 2
 
     def test_report_gate_loss_out_of_range_raises(
-        self, priority_scheduler: LayerRotationScheduler
+        self, priority_scheduler: LayerRotationScheduler,
     ) -> None:
         with pytest.raises(ValueError, match="layer_idx.*out of range"):
             priority_scheduler.report_gate_loss(8, 1.0)
 
     def test_report_gate_loss_negative_index_raises(
-        self, priority_scheduler: LayerRotationScheduler
+        self, priority_scheduler: LayerRotationScheduler,
     ) -> None:
         with pytest.raises(ValueError, match="layer_idx.*out of range"):
             priority_scheduler.report_gate_loss(-1, 1.0)
@@ -341,7 +339,6 @@ class TestCoverageStats:
     def test_max_gap_increases_until_recalibration(self) -> None:
         s = LayerRotationScheduler(num_layers=4, layers_per_step=1)
 
-        prev_max_gap = -1
         # Step through: layer 0, 1, 2, 3, 0, 1, ...
         for step in range(4):
             s.get_active_layers()
@@ -394,7 +391,7 @@ class TestCyclesForFullCoverage:
     """Minimum steps for every layer to be calibrated once."""
 
     @pytest.mark.parametrize(
-        "num_layers,layers_per_step,expected",
+        ("num_layers", "layers_per_step", "expected"),
         [
             (8, 2, 4),
             (8, 4, 2),

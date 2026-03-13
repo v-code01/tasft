@@ -9,8 +9,7 @@ All spans include TASFT-specific attributes for cross-system correlation.
 from __future__ import annotations
 
 from contextlib import contextmanager
-from collections.abc import Generator
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from opentelemetry import trace
 from opentelemetry.sdk.resources import Resource
@@ -20,6 +19,9 @@ from opentelemetry.sdk.trace.export import (
     SpanExporter,
 )
 from opentelemetry.trace import Span, StatusCode, Tracer
+
+if TYPE_CHECKING:
+    from collections.abc import Generator
 
 _TRACER_NAME = "tasft"
 _tracer: Tracer | None = None
