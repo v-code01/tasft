@@ -1,5 +1,5 @@
-# TASFT Training Configuration: Llama-3-8B on MedQA
-# Co-trains LoRA adapters + AttnGate modules for sparse medical QA inference
+# TASFT Reproducibility Config: Llama-3-8B on MedQA
+# Reference configuration for the reproduce.py single-command evaluation.
 #
 # Expected outcome:
 #   - MedQA accuracy within 1% of dense fine-tuned baseline
@@ -8,9 +8,12 @@
 #
 # Hardware: 2x H100-80GB assumed
 # Wall time: ~4h on 2x H100-80GB
+#
+# This is the canonical config for reproducing Table 1 in the paper.
 
 model:
   base_model_id: "meta-llama/Meta-Llama-3-8B"
+  model_name: "TASFT-Llama3-8B-MedQA"
   torch_dtype: "bfloat16"
   attn_implementation: "eager"  # Required for full attention score extraction during gate calibration
 
@@ -47,11 +50,10 @@ objective:
 layer_rotation:
   strategy: "round_robin"  # Deterministic cycling through all 32 layers
   layers_per_step: 4       # Calibrate 4 of 32 layers per step -> 8 cycles for full coverage
-  # Estimated activation memory: 4 * 4 * 32 * 2048^2 * 2 bytes = ~4.3 GB (manageable on H100)
   ema_alpha: 0.1
   seed: 42
 
-# Training hyperparameters
+# Training hyperparameters (paper Table 1 settings)
 training:
   output_dir: "./outputs/llama3_8b_medqa"
   num_train_epochs: 3
@@ -78,7 +80,7 @@ training:
   load_best_model_at_end: true
   metric_for_best_model: "eval_loss"
   greater_is_better: false
-  report_to: "wandb"
+  report_to: "none"
   run_name: "tasft-llama3-8b-medqa"
 
 # Dataset configuration
@@ -91,7 +93,6 @@ dataset:
   max_samples_train: null  # Use full dataset
   max_samples_eval: 1000
   preprocessing:
-    # Format: "Question: {question}\nAnswer: {answer}"
     template: "Question: {question}\nAnswer: {answer}"
     truncation: true
     padding: "max_length"
@@ -106,6 +107,7 @@ evaluation:
   gate_eval:
     compute_sparsity_profile: true
     compute_kl_divergence: true
+    block_size: 64
   throughput_eval:
     seq_lengths: [512, 1024, 2048]
     batch_sizes: [1, 4, 8]
@@ -122,9 +124,9 @@ bundle:
 observability:
   log_level: "INFO"
   log_json: true
-  metrics_push_gateway: null  # Set to Pushgateway URL if available
-  tracing_endpoint: null  # Set to OTLP endpoint if available
+  metrics_push_gateway: null
+  tracing_endpoint: null
   wandb:
     project: "tasft"
     entity: null
-    tags: ["llama3-8b", "medqa", "sparse-attention"]
+    tags: ["llama3-8b", "medqa", "sparse-attention", "reproducibility"]

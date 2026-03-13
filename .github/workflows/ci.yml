@@ -1,6 +1,17 @@
 name: CI
 
-on: [push, pull_request]
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main, develop]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  PYTHON_DEFAULT: "3.11"
 
 jobs:
   lint:
@@ -18,47 +29,90 @@ jobs:
     steps:
       - uses: actions/checkout@v4.1.7
       - uses: actions/setup-python@v5.1.1
-        with: {python-version: "3.11"}
+        with: { python-version: "3.11" }
       - uses: actions/cache@v4.0.2
         with:
           path: ~/.cache/pip
-          key: ${{ runner.os }}-pip-${{ hashFiles('pyproject.toml') }}
-          restore-keys: ${{ runner.os }}-pip-
+          key: ${{ runner.os }}-pip-typecheck-${{ hashFiles('pyproject.toml') }}
+          restore-keys: ${{ runner.os }}-pip-typecheck-
       - run: pip install -e ".[dev]"
-      - run: mypy tasft/
+      - run: mypy --strict tasft/
 
   unit-tests:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     strategy:
+      fail-fast: false
       matrix:
         python-version: ["3.11", "3.12"]
     steps:
       - uses: actions/checkout@v4.1.7
       - uses: actions/setup-python@v5.1.1
-        with: {python-version: "${{ matrix.python-version }}"}
+        with: { python-version: "${{ matrix.python-version }}" }
       - uses: actions/cache@v4.0.2
         with:
           path: ~/.cache/pip
           key: ${{ runner.os }}-pip-py${{ matrix.python-version }}-${{ hashFiles('pyproject.toml') }}
           restore-keys: ${{ runner.os }}-pip-py${{ matrix.python-version }}-
       - run: pip install -e ".[dev]"
-      - run: pytest tests/unit/ -v --tb=short --cov=tasft --cov-report=term-missing
+      - name: Run unit tests with coverage
+        run: >-
+          pytest tests/unit/ -x -v --tb=short --timeout=30
+          --cov=tasft
+          --cov-report=term-missing
+          --cov-report=xml:coverage-unit.xml
+          --junitxml=junit-unit.xml
+      - name: Upload unit test coverage
+        if: always() && matrix.python-version == '3.11'
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-unit
+          path: coverage-unit.xml
+          retention-days: 7
+      - name: Upload unit test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: junit-unit-py${{ matrix.python-version }}
+          path: junit-unit.xml
+          retention-days: 7
 
   integration-tests:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 30
+    needs: [lint, typecheck]
     steps:
       - uses: actions/checkout@v4.1.7
       - uses: actions/setup-python@v5.1.1
-        with: {python-version: "3.11"}
+        with: { python-version: "3.11" }
       - uses: actions/cache@v4.0.2
         with:
           path: ~/.cache/pip
-          key: ${{ runner.os }}-pip-${{ hashFiles('pyproject.toml') }}
-          restore-keys: ${{ runner.os }}-pip-
+          key: ${{ runner.os }}-pip-integration-${{ hashFiles('pyproject.toml') }}
+          restore-keys: ${{ runner.os }}-pip-integration-
       - run: pip install -e ".[dev]"
-      - run: pytest tests/integration/ -v --timeout=120 -m "not slow"
+      - name: Run integration tests with coverage
+        run: >-
+          pytest tests/integration/ -x -v --tb=short --timeout=120
+          -m "not slow"
+          --cov=tasft
+          --cov-report=term-missing
+          --cov-report=xml:coverage-integration.xml
+          --junitxml=junit-integration.xml
+      - name: Upload integration test coverage
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-integration
+          path: coverage-integration.xml
+          retention-days: 7
+      - name: Upload integration test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: junit-integration
+          path: junit-integration.xml
+          retention-days: 7
 
   import-smoke:
     runs-on: ubuntu-latest
@@ -66,11 +120,75 @@ jobs:
     steps:
       - uses: actions/checkout@v4.1.7
       - uses: actions/setup-python@v5.1.1
-        with: {python-version: "3.11"}
+        with: { python-version: "3.11" }
       - uses: actions/cache@v4.0.2
         with:
           path: ~/.cache/pip
-          key: ${{ runner.os }}-pip-${{ hashFiles('pyproject.toml') }}
-          restore-keys: ${{ runner.os }}-pip-
+          key: ${{ runner.os }}-pip-smoke-${{ hashFiles('pyproject.toml') }}
+          restore-keys: ${{ runner.os }}-pip-smoke-
       - run: pip install -e ".[dev]"
       - run: pytest tests/unit/test_import_smoke.py -v --tb=short
+
+  coverage-report:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    needs: [unit-tests, integration-tests]
+    if: always() && github.event_name == 'pull_request'
+    steps:
+      - uses: actions/checkout@v4.1.7
+      - name: Download unit coverage
+        uses: actions/download-artifact@v4
+        with:
+          name: coverage-unit
+          path: coverage/
+        continue-on-error: true
+      - name: Download integration coverage
+        uses: actions/download-artifact@v4
+        with:
+          name: coverage-integration
+          path: coverage/
+        continue-on-error: true
+      - uses: actions/setup-python@v5.1.1
+        with: { python-version: "3.11" }
+      - name: Install coverage tools
+        run: pip install coverage
+      - name: Report coverage summary
+        run: |
+          echo "## Coverage Reports" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          if [ -f coverage/coverage-unit.xml ]; then
+            echo "- Unit test coverage report uploaded" >> $GITHUB_STEP_SUMMARY
+          fi
+          if [ -f coverage/coverage-integration.xml ]; then
+            echo "- Integration test coverage report uploaded" >> $GITHUB_STEP_SUMMARY
+          fi
+
+  ci-gate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 1
+    needs: [lint, typecheck, unit-tests, integration-tests, import-smoke]
+    if: always()
+    steps:
+      - name: Evaluate CI results
+        run: |
+          if [ "${{ needs.lint.result }}" != "success" ]; then
+            echo "Lint failed"
+            exit 1
+          fi
+          if [ "${{ needs.typecheck.result }}" != "success" ]; then
+            echo "Typecheck failed"
+            exit 1
+          fi
+          if [ "${{ needs.unit-tests.result }}" != "success" ]; then
+            echo "Unit tests failed"
+            exit 1
+          fi
+          if [ "${{ needs.integration-tests.result }}" != "success" ]; then
+            echo "Integration tests failed"
+            exit 1
+          fi
+          if [ "${{ needs.import-smoke.result }}" != "success" ]; then
+            echo "Import smoke test failed"
+            exit 1
+          fi
+          echo "All CI checks passed"
