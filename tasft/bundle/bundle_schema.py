@@ -11,12 +11,10 @@ All schema models are frozen (immutable) and JSON-serializable.
 """
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Annotated
+from datetime import datetime  # noqa: TC003 — runtime dependency for Pydantic model_validate()
+from typing import Annotated
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
-
-if TYPE_CHECKING:
-    from datetime import datetime
 
 
 class LayerKernelConfig(BaseModel):
