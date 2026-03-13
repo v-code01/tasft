@@ -11,7 +11,6 @@ All schema models are frozen (immutable) and JSON-serializable.
 """
 from __future__ import annotations
 
-import re
 from typing import TYPE_CHECKING, Annotated
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
@@ -86,7 +85,26 @@ class KernelConfig(BaseModel):
         return self
 
 
-_SHA256_COMPILED = re.compile(r"^[a-f0-9]{64}$")
+_SHA256_HEX_CHARS = frozenset("0123456789abcdef")
+_SHA256_HEX_LEN = 64
+
+
+def _is_valid_sha256_hex(value: str) -> bool:
+    """Validate a string is a 64-char lowercase hex SHA-256 digest.
+
+    Uses set membership testing instead of regex per Λ₂.
+
+    Args:
+        value: String to validate.
+
+    Returns:
+        True if value is exactly 64 lowercase hex characters.
+
+    Complexity: O(n) where n = len(value), early-exit on length mismatch.
+    """
+    if len(value) != _SHA256_HEX_LEN:
+        return False
+    return all(c in _SHA256_HEX_CHARS for c in value)
 
 
 class BundleManifest(BaseModel):
@@ -121,7 +139,7 @@ class BundleManifest(BaseModel):
     def validate_checksums(cls, v: dict[str, str]) -> dict[str, str]:
         """Validate all checksums are valid SHA256 hex digests (64 lowercase hex chars)."""
         for filename, checksum in v.items():
-            if not _SHA256_COMPILED.match(checksum):
+            if not _is_valid_sha256_hex(checksum):
                 msg = f"Invalid SHA256 checksum for {filename}: {checksum}"
                 raise ValueError(
                     msg,
