@@ -1,0 +1,80 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+pip-wheel-metadata/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Virtual environments
+.env
+.venv
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# ML artifacts (large binaries — use DVC or HuggingFace Hub instead)
+*.safetensors
+*.bin
+*.pt
+*.pth
+!tests/fixtures/**/*.safetensors  # allow test fixtures if any
+
+# Training outputs
+runs/
+wandb/
+outputs/
+checkpoints/
+*.ckpt
+
+# Benchmark results
+bench_results.json
+*.benchmark.json
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Tooling caches
+.ruff_cache/
+.mypy_cache/
+.pytest_cache/
+.hypothesis/
+htmlcov/
+.coverage
+coverage.xml
+*.cover
+
+# Jupyter
+.ipynb_checkpoints
+*.ipynb
+
+# Secrets
+.env.local
+.env.*.local
+secrets.yaml

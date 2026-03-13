@@ -1,0 +1,39 @@
+line-length = 100
+target-version = "py311"
+
+[lint]
+select = ["ALL"]
+ignore = [
+    "D",      # docstring style (we enforce content, not style)
+    "ANN101", # self annotation
+    "ANN102", # cls annotation
+    "S101",   # assert in tests is fine
+    "T201",   # print in scripts is fine
+    "FIX002", # TODO comments (we ban them via other means)
+    "TD",     # TODO format
+    "ERA001", # commented-out code (caught by other tooling)
+]
+
+[lint.isort]
+known-first-party = ["tasft"]
+
+[lint.per-file-ignores]
+"tests/**" = ["S", "ANN", "PLR2004"]
+"scripts/**" = ["T201", "ANN"]
+# Triton JIT kernels: no type annotations on pointer args, uppercase tensor dims,
+# many args (GPU strides), conditional imports, f-string exceptions
+# Pydantic validators use f-string error messages for clear validation feedback
+"tasft/kernels/kernel_config.py" = [
+    "EM102",   # Validator error messages benefit from f-strings for clarity
+    "TRY003",  # ValueError in validators is idiomatic Pydantic
+]
+"tasft/kernels/block_sparse_fa.py" = [
+    "ANN001", "ANN202",  # Triton JIT args cannot have Python type annotations
+    "N803", "N806",       # Uppercase Q_ptr, K_ptr, B, H, S, D are GPU conventions
+    "PLR0913",            # Kernel functions require many stride arguments
+    "PLC0415",            # Runtime backend detection requires conditional imports
+    "EM101", "EM102",     # KernelError messages are structured (carry context dict)
+    "TRY003",             # KernelError is our own exception with structured context
+    "FBT001",             # causal: bool is standard attention API
+    "COM812",             # trailing commas in kernel launch args
+]

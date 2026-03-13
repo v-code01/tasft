@@ -1,0 +1,127 @@
+# TASFT Training Configuration: Qwen-2.5-7B on Code Generation
+# Co-trains LoRA adapters + AttnGate modules for sparse code completion inference
+#
+# Expected outcome:
+#   - HumanEval pass@1 within 2% of dense fine-tuned baseline
+#   - Mean attention sparsity >= 0.65 (target 0.8)
+#   - 2-4x decode throughput improvement via block-sparse attention
+#
+# Hardware: 2x H100-80GB assumed
+# Wall time: ~6h on 2x H100-80GB (code datasets are larger)
+
+model:
+  base_model_id: "Qwen/Qwen2.5-7B"
+  torch_dtype: "bfloat16"
+  attn_implementation: "eager"  # Required for full attention score extraction during gate calibration
+
+# LoRA configuration for task adaptation
+lora:
+  r: 32
+  alpha: 64
+  dropout: 0.05
+  target_modules:
+    - "q_proj"
+    - "k_proj"
+    - "v_proj"
+    - "o_proj"
+  bias: "none"
+  task_type: "CAUSAL_LM"
+
+# AttnGate configuration for sparse attention learning
+gate:
+  block_size: 64
+  gate_hidden_dim: 32
+  default_threshold: 0.5
+  num_layers: 28  # Qwen2.5-7B has 28 layers
+
+# Dual objective: L_total = L_task + lambda_gate * (L_gate + beta_sparse * L_sparse)
+objective:
+  lambda_gate: 0.1
+  beta_sparse: 0.01
+  tau_target: 0.8
+  label_smoothing: 0.0
+  gate_lr_ratio: 0.1      # gate_lr = learning_rate * 0.1 = 1.5e-5
+  gate_warmup_steps: 100
+
+# Layer rotation scheduler for memory-efficient gate calibration
+layer_rotation:
+  strategy: "round_robin"  # Deterministic cycling
+  layers_per_step: 4       # Calibrate 4 of 28 layers per step -> 7 cycles for full coverage
+  ema_alpha: 0.1
+  seed: 42
+
+# Training hyperparameters
+training:
+  output_dir: "./outputs/qwen25_7b_code"
+  num_train_epochs: 2
+  per_device_train_batch_size: 2
+  per_device_eval_batch_size: 4
+  gradient_accumulation_steps: 8
+  # Effective batch size: 2 * 8 = 16
+  learning_rate: 1.5e-4
+  lr_scheduler_type: "cosine"
+  warmup_ratio: 0.03
+  weight_decay: 0.01
+  max_grad_norm: 1.0
+  max_seq_length: 4096  # Longer context for code
+  bf16: true
+  gradient_checkpointing: true
+  dataloader_num_workers: 4
+  dataloader_pin_memory: true
+  seed: 42
+  logging_steps: 10
+  eval_steps: 500
+  save_steps: 1000
+  save_total_limit: 3
+  eval_strategy: "steps"
+  load_best_model_at_end: true
+  metric_for_best_model: "eval_loss"
+  greater_is_better: false
+  report_to: "wandb"
+  run_name: "tasft-qwen25-7b-code"
+
+# Dataset configuration
+dataset:
+  name: "bigcode/starcoderdata"
+  subset: "python"
+  split_train: "train"
+  split_eval: "validation"
+  text_column: "content"
+  max_samples_train: 100000  # Subsample from large corpus
+  max_samples_eval: 2000
+  preprocessing:
+    truncation: true
+    padding: "max_length"
+
+# Evaluation configuration
+evaluation:
+  task_eval:
+    benchmark: "humaneval"
+    num_fewshot: 0
+    batch_size: 8
+    pass_k: [1, 10]
+  gate_eval:
+    compute_sparsity_profile: true
+    compute_kl_divergence: true
+  throughput_eval:
+    seq_lengths: [512, 1024, 2048, 4096]
+    batch_sizes: [1, 4]
+    num_warmup: 5
+    num_iterations: 50
+
+# Bundle export configuration
+bundle:
+  output_dir: "./bundles/qwen25_7b_code"
+  include_eval_summary: true
+  compress: false
+
+# Observability
+observability:
+  log_level: "INFO"
+  log_json: true
+  metrics_push_gateway: null
+  tracing_endpoint: null
+  wandb:
+    project: "tasft"
+    entity: null
+    tags: ["qwen25-7b", "code", "sparse-attention", "humaneval"]

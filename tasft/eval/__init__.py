@@ -1,0 +1,43 @@
+"""
+TASFT eval: evaluation harness for task quality, gate quality, and inference throughput.
+
+This package contains:
+- task_eval: Domain task evaluation (MedQA, HumanEval) with statistical comparison
+- throughput_bench: Inference throughput benchmarking across batch/seq configurations
+- gate_quality: Core ablation study — co-trained vs post-hoc gate KL divergence
+"""
+from tasft.eval.gate_quality import (
+    AblationResult,
+    GateEvalError,
+    GateQualityEvaluator,
+    GateQualityResult,
+)
+from tasft.eval.task_eval import (
+    ComparisonResult,
+    EvalError,
+    TaskEvalResult,
+    TaskEvaluator,
+)
+from tasft.eval.throughput_bench import (
+    BenchmarkError,
+    BenchmarkPoint,
+    SpeedupMatrix,
+    ThroughputBenchmark,
+    ThroughputMatrix,
+)
+
+__all__ = [
+    "AblationResult",
+    "BenchmarkError",
+    "BenchmarkPoint",
+    "ComparisonResult",
+    "EvalError",
+    "GateEvalError",
+    "GateQualityEvaluator",
+    "GateQualityResult",
+    "SpeedupMatrix",
+    "TaskEvalResult",
+    "TaskEvaluator",
+    "ThroughputBenchmark",
+    "ThroughputMatrix",
+]
