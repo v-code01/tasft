@@ -38,16 +38,15 @@ from __future__ import annotations
 from typing import Any
 
 import torch
-import torch.nn as nn
+from torch import nn
 
-from tasft.modules.attn_gate import AttnGate
 from tasft.modules.tasft_attention import (
     GateConfig,
     TASFTAttention,
     patch_model_attention,
 )
 from tasft.observability import bind_context, get_logger
-from tasft.observability.metrics import TASFTMetrics, track_step
+from tasft.observability.metrics import TASFTMetrics
 from tasft.training.layer_rotation import LayerRotationScheduler, RotationStrategy
 from tasft.training.objectives import TASFTObjective
 
@@ -299,23 +298,29 @@ class TASFTPlugin:
         logger.info("tasft_plugin_post_training", bundle_dir=bundle_dir)
 
         try:
-            from tasft.bundle.exporter import BundleExporter
+            from tasft.bundle.export import BundleExporter, ExportConfig
 
-            exporter = BundleExporter(
+            model_cfg = cfg.get("model", {})
+            gate_cfg = self._plugin_config.get("gate", {})
+            export_config = ExportConfig(
+                model_name=model_cfg.get("model_name", model_cfg.get("base_model_id", "unknown")),
+                base_model_id=model_cfg.get("base_model_id", "unknown"),
+                domain=cfg.get("domain", "general"),
+                block_size=gate_cfg.get("block_size", 64),
+                global_threshold=gate_cfg.get("default_threshold", 0.5),
+            )
+            exporter = BundleExporter(config=export_config)
+            bundle_path = exporter.export(
                 model=model,
-                gate_modules={
-                    idx: tasft_attn.gate for idx, tasft_attn in self._patched_layers.items()
-                },
-                training_config=cfg,
                 output_dir=bundle_dir,
             )
-            manifest = exporter.export()
+            metadata = BundleExporter.load_bundle_metadata(bundle_path)
 
             logger.info(
                 "tasft_bundle_exported",
-                bundle_dir=bundle_dir,
-                num_files=len(manifest.file_checksums),
-                total_size_bytes=manifest.total_size_bytes,
+                bundle_dir=str(bundle_path),
+                num_files=len(metadata.manifest.checksums),
+                total_size_bytes=metadata.manifest.total_size_bytes,
             )
         except Exception:
             logger.exception("tasft_bundle_export_failed")

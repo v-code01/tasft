@@ -519,14 +519,16 @@ def unpatch_vllm_attention(vllm_worker: Any) -> None:
 def is_patched() -> bool:
     """Check if TASFT vLLM patch is currently applied.
 
-    Thread-safe read of patch state.
+    Thread-safe read of patch state. Acquires _patch_lock to ensure
+    visibility across threads (safe for GIL-free Python per PEP 703).
 
     Returns:
         True if patch_vllm_attention has been called and not unpatched.
 
     Complexity: O(1).
     """
-    return _patch_applied
+    with _patch_lock:
+        return _patch_applied
 
 
 __all__ = [

@@ -41,7 +41,8 @@ known-first-party = ["tasft"]
 
 [lint.per-file-ignores]
 "tests/**" = ["S", "ANN", "PLR2004", "SLF001", "ARG002", "N806", "N803", "N812", "PLR0915", "C901", "E741", "PLR0912", "FBT003", "B017", "PT011", "ARG001", "TC003", "SIM117", "B007"]
-"scripts/**" = ["T201", "ANN"]
+"scripts/**" = ["T201", "ANN", "B008", "FBT003", "ARG002", "TRY004", "PLR0915", "TC003", "EXE001", "C901", "PLR0912"]
+"axolotl_plugin/**" = ["ANN", "ARG002", "TC002", "TC003", "E501"]
 # Tensor code uses uppercase dimension variables (B, H, S, D) per GPU/ML convention
 "tasft/modules/**" = ["N806", "N803", "N812", "ARG002", "PLR2004"]
 "tasft/training/**" = ["N806", "N803", "N812", "ARG002", "PLR2004", "C901", "ARG005", "B007"]
