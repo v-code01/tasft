@@ -1,0 +1,38 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "tasft"
+version = "0.1.0"
+description = "Task-Aware Sparse Fine-Tuning: co-training domain adaptation with sparse attention gates"
+requires-python = ">=3.11"
+dependencies = [
+    "torch>=2.3.0",
+    "transformers>=4.40.0",
+    "peft>=0.11.0",
+    "flash-attn>=2.5.0",
+    "safetensors>=0.4.0",
+    "pydantic>=2.0.0",
+    "structlog>=24.0.0",
+    "prometheus-client>=0.20.0",
+    "opentelemetry-api>=1.24.0",
+    "opentelemetry-sdk>=1.24.0",
+    "opentelemetry-exporter-otlp>=1.24.0",
+    "triton>=2.3.0",
+]
+
+[project.optional-dependencies]
+train = ["axolotl>=0.4.0", "wandb>=0.17.0", "typer>=0.12.0"]
+eval = ["lm-eval>=0.4.0"]
+dev = [
+    "pytest>=8.0.0",
+    "pytest-benchmark>=4.0.0",
+    "pytest-timeout>=2.3.0",
+    "pytest-asyncio>=0.23.0",
+    "hypothesis>=6.100.0",
+    "ruff>=0.4.0",
+    "mypy>=1.10.0",
+    "pre-commit>=3.7.0",
+    "benchstat>=0.0.1",
+]
