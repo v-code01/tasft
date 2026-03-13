@@ -69,8 +69,8 @@ class GateConfig:
                 msg,
                 context={"num_layers": self.num_layers},
             )
-        if not 0.0 <= self.default_threshold <= 1.0:
-            msg = f"default_threshold must be in [0, 1], got {self.default_threshold}"
+        if not 0.0 < self.default_threshold < 1.0:
+            msg = f"default_threshold must be in (0, 1) exclusive, got {self.default_threshold}"
             raise ValidationError(
                 msg,
                 context={"default_threshold": self.default_threshold},

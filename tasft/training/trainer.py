@@ -29,17 +29,20 @@ from __future__ import annotations
 
 import json
 import os
+import time
 import warnings
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
-import structlog
 import torch
 from torch import nn
 from torch.optim.lr_scheduler import LambdaLR
 from transformers import Trainer, TrainingArguments
 
 from tasft.exceptions import NaNDetectedError, TrainingError
+from tasft.observability.logging import get_logger
+from tasft.observability.metrics import TASFTMetrics
+from tasft.observability.tracing import trace_training_step
 from tasft.training.layer_rotation import (
     LayerRotationScheduler,
     RotationStrategy,
@@ -52,7 +55,7 @@ if TYPE_CHECKING:
 
     from tasft.modules.tasft_attention import TASFTAttention
 
-logger = structlog.get_logger("tasft.training.trainer")
+logger = get_logger(__name__)
 
 _ROTATION_STRATEGY_MAP: dict[str, RotationStrategy] = {
     "round_robin": RotationStrategy.ROUND_ROBIN,
@@ -211,6 +214,9 @@ class TASFTTrainer(Trainer):
         # Gate warmup LR scheduler (created in create_optimizer)
         self._gate_lr_scheduler: LambdaLR | None = None
 
+        # Observability: Prometheus metrics registry
+        self._metrics = TASFTMetrics()
+
         logger.info(
             "tasft_trainer_init",
             num_layers=self._num_model_layers,
@@ -361,116 +367,182 @@ class TASFTTrainer(Trainer):
         Complexity: O(L_active · B · H · S² + B · S · V).
         """
         model.train()
+        step_start_ns = time.perf_counter_ns()
 
         # Step 1: Select active layers for this step
         active_layers = self._rotation_scheduler.get_active_layers()
         active_indices = [int(li) for li in active_layers]
 
-        # Step 2: Enable gate target computation on active layers only
-        for idx, tasft_attn in self._patched_layers.items():
-            tasft_attn.set_training_mode(idx in active_indices)
+        # Wrap the entire step body in an OTel span for distributed tracing.
+        # get_tracer() returns a noop tracer when OTel is not configured, so this
+        # adds zero overhead in the unconfigured case.
+        with trace_training_step(
+            step=self.state.global_step,
+            active_layers=active_indices,
+        ) as span:
+            # Step 2: Enable gate target computation on active layers only
+            for idx, tasft_attn in self._patched_layers.items():
+                tasft_attn.set_training_mode(idx in active_indices)
 
-        # Step 3: Forward pass
-        inputs = self._prepare_inputs(inputs)
-        labels = inputs.get("labels")
-        if labels is None:
-            msg = "Labels must be provided in inputs for TASFT training"
-            raise TrainingError(
-                msg,
-                context={"input_keys": list(inputs.keys())},
-            )
-
-        with self.compute_loss_context_manager():
-            outputs = model(**inputs, output_attentions=True)
-
-        logits = outputs.logits if hasattr(outputs, "logits") else outputs[0]
-
-        # Step 4: Collect gate outputs and attention scores from active layers
-        gate_outputs_by_layer: dict[int, torch.Tensor] = {}
-        attn_scores_by_layer: dict[int, torch.Tensor] = {}
-
-        for idx in active_indices:
-            tasft_attn = self._patched_layers[idx]
-            # After forward, TASFTAttention stores gate_output in its last output
-            # We need to extract from the model's layer outputs
-            # The model forward collects these in a hook-based or attribute-based pattern
-            gate_out = self._extract_gate_output(model, idx)
-            attn_scores = self._extract_attn_scores(model, idx)
-
-            if gate_out is not None and attn_scores is not None:
-                gate_outputs_by_layer[idx] = gate_out
-                attn_scores_by_layer[idx] = attn_scores
-
-        # Step 5: Compute dual loss
-        # Determine gate loss scaling based on warmup
-        global_step = self.state.global_step
-        gate_warmup_multiplier = self._get_gate_warmup_multiplier(global_step)
-
-        if gate_outputs_by_layer and gate_warmup_multiplier > 0.0:
-            loss_output = self._objective.compute(
-                logits=logits,
-                labels=labels,
-                gate_outputs_by_layer=gate_outputs_by_layer,
-                attn_scores_by_layer=attn_scores_by_layer,
-                active_layer_indices=list(gate_outputs_by_layer.keys()),
-                block_size=self._tasft_args.block_size,
-            )
-            # Scale gate component by warmup multiplier
-            loss = (
-                loss_output.task
-                + self._tasft_args.lambda_gate
-                * gate_warmup_multiplier
-                * (loss_output.gate + self._tasft_args.beta_sparse * loss_output.sparse)
-            )
-        else:
-            # No active gate outputs or in warmup cold phase — task loss only
-            loss = self._objective.compute_task_loss(logits, labels)
-            loss_output = None
-
-        # NaN guard
-        if not torch.isfinite(loss):
-            msg = "Non-finite loss detected in training_step"
-            raise NaNDetectedError(
-                msg,
-                context={
-                    "global_step": global_step,
-                    "loss_value": loss.item() if loss.numel() == 1 else "multi-element",
-                    "active_layers": active_indices,
-                },
-            )
-
-        # Step 6: Report gate losses for priority-weighted rotation
-        if loss_output is not None:
-            for li, gate_loss_val in loss_output.per_layer_gate_loss.items():
-                self._rotation_scheduler.report_gate_loss(int(li), gate_loss_val)
-
-        # Step 7: Step gate warmup scheduler
-        # Suppress PyTorch warning about lr_scheduler.step() before optimizer.step():
-        # the HF Trainer calls optimizer.step() AFTER training_step() returns, so the
-        # gate LR scheduler step necessarily precedes the first optimizer.step(). This
-        # ordering is intentional — the scheduler adjusts gate LR for the NEXT step.
-        if self._gate_lr_scheduler is not None:
-            with warnings.catch_warnings():
-                warnings.filterwarnings(
-                    "ignore",
-                    message="Detected call of `lr_scheduler.step\\(\\)` before",
-                    category=UserWarning,
+            # Step 3: Forward pass
+            inputs = self._prepare_inputs(inputs)
+            labels = inputs.get("labels")
+            if labels is None:
+                msg = "Labels must be provided in inputs for TASFT training"
+                raise TrainingError(
+                    msg,
+                    context={"input_keys": list(inputs.keys())},
                 )
-                self._gate_lr_scheduler.step()
 
-        # Step 8: Structured logging
-        self._log_training_step(global_step, loss, loss_output, active_indices)
+            with self.compute_loss_context_manager():
+                outputs = model(**inputs, output_attentions=True)
 
-        # Normalize loss for gradient accumulation (matches HF Trainer convention)
-        loss = loss / self.args.gradient_accumulation_steps
+            logits = outputs.logits if hasattr(outputs, "logits") else outputs[0]
 
-        # Backward pass: HF Trainer expects training_step to call backward() internally.
-        # During gate warmup with no LoRA adapters, the task-only loss may have no grad_fn
-        # (all base params frozen). Guard against backward on a non-differentiable tensor.
-        if loss.requires_grad:
-            self.accelerator.backward(loss)
+            # Step 4: Collect gate outputs and attention scores from active layers
+            gate_outputs_by_layer: dict[int, torch.Tensor] = {}
+            attn_scores_by_layer: dict[int, torch.Tensor] = {}
+
+            for idx in active_indices:
+                tasft_attn = self._patched_layers[idx]
+                gate_out = self._extract_gate_output(model, idx)
+                attn_scores = self._extract_attn_scores(model, idx)
+
+                if gate_out is not None and attn_scores is not None:
+                    gate_outputs_by_layer[idx] = gate_out
+                    attn_scores_by_layer[idx] = attn_scores
+
+            # Step 5: Compute dual loss
+            # Determine gate loss scaling based on warmup
+            global_step = self.state.global_step
+            gate_warmup_multiplier = self._get_gate_warmup_multiplier(global_step)
+
+            if gate_outputs_by_layer and gate_warmup_multiplier > 0.0:
+                loss_output = self._objective.compute(
+                    logits=logits,
+                    labels=labels,
+                    gate_outputs_by_layer=gate_outputs_by_layer,
+                    attn_scores_by_layer=attn_scores_by_layer,
+                    active_layer_indices=list(gate_outputs_by_layer.keys()),
+                    block_size=self._tasft_args.block_size,
+                )
+                # Scale gate component by warmup multiplier
+                loss = (
+                    loss_output.task
+                    + self._tasft_args.lambda_gate
+                    * gate_warmup_multiplier
+                    * (loss_output.gate + self._tasft_args.beta_sparse * loss_output.sparse)
+                )
+            else:
+                # No active gate outputs or in warmup cold phase — task loss only
+                loss = self._objective.compute_task_loss(logits, labels)
+                loss_output = None
+
+            # NaN guard
+            if not torch.isfinite(loss):
+                self._metrics.record_error("nan_detected")
+                span.set_attribute("tasft.nan_detected", "true")
+                msg = "Non-finite loss detected in training_step"
+                raise NaNDetectedError(
+                    msg,
+                    context={
+                        "global_step": global_step,
+                        "loss_value": loss.item() if loss.numel() == 1 else "multi-element",
+                        "active_layers": active_indices,
+                    },
+                )
+
+            # Step 6: Report gate losses for priority-weighted rotation
+            if loss_output is not None:
+                for li, gate_loss_val in loss_output.per_layer_gate_loss.items():
+                    self._rotation_scheduler.report_gate_loss(int(li), gate_loss_val)
+
+            # Step 7: Step gate warmup scheduler
+            # Suppress PyTorch warning about lr_scheduler.step() before optimizer.step():
+            # the HF Trainer calls optimizer.step() AFTER training_step() returns, so the
+            # gate LR scheduler step necessarily precedes the first optimizer.step(). This
+            # ordering is intentional — the scheduler adjusts gate LR for the NEXT step.
+            if self._gate_lr_scheduler is not None:
+                with warnings.catch_warnings():
+                    warnings.filterwarnings(
+                        "ignore",
+                        message="Detected call of `lr_scheduler.step\\(\\)` before",
+                        category=UserWarning,
+                    )
+                    self._gate_lr_scheduler.step()
+
+            # Step 8: Structured logging
+            self._log_training_step(global_step, loss, loss_output, active_indices)
+
+            # Step 9: Record Prometheus metrics and OTel span attributes
+            step_duration_s = (time.perf_counter_ns() - step_start_ns) / 1_000_000_000
+            self._record_step_observability(
+                span, step_duration_s, loss, loss_output,
+                active_indices, gate_warmup_multiplier,
+            )
+
+            # Normalize loss for gradient accumulation (matches HF Trainer convention)
+            loss = loss / self.args.gradient_accumulation_steps
+
+            # Backward pass: HF Trainer expects training_step to call backward() internally.
+            # During gate warmup with no LoRA adapters, the task-only loss may have no grad_fn
+            # (all base params frozen). Guard against backward on a non-differentiable tensor.
+            if loss.requires_grad:
+                self.accelerator.backward(loss)
 
         return loss.detach()
+
+    def _record_step_observability(
+        self,
+        span: Any,
+        step_duration_s: float,
+        loss: torch.Tensor,
+        loss_output: ObjectiveLossOutput | None,
+        active_indices: list[int],
+        gate_warmup_multiplier: float,
+    ) -> None:
+        """Record Prometheus metrics and OTel span attributes for a training step.
+
+        Captures step duration, active layer count, effective lambda, per-layer
+        sparsity ratios, GPU memory saturation, and loss component breakdowns.
+
+        Args:
+            span: The active OTel Span for attribute attachment.
+            step_duration_s: Wall-clock duration of the step in seconds.
+            loss: Total loss tensor (pre-accumulation normalization).
+            loss_output: Decomposed loss output (None if task-only).
+            active_indices: Layer indices active this step.
+            gate_warmup_multiplier: Current gate warmup scaling factor.
+
+        Preconditions: step_duration_s > 0, loss is a finite scalar.
+        Postconditions: All metrics recorded, span attributes set.
+        Complexity: O(L_active).
+        """
+        self._metrics.record_step(step_duration_s)
+        self._metrics.set_active_layers(len(active_indices))
+        self._metrics.set_lambda_gate(
+            self._tasft_args.lambda_gate * gate_warmup_multiplier,
+        )
+
+        # Record per-layer sparsity from loss output
+        if loss_output is not None and loss_output.per_layer_sparsity:
+            for layer_idx, ratio in loss_output.per_layer_sparsity.items():
+                self._metrics.record_sparsity(int(layer_idx), ratio)
+
+        # Record GPU memory saturation if CUDA is available
+        if torch.cuda.is_available():
+            self._metrics.set_gpu_memory(
+                device=str(torch.cuda.current_device()),
+                bytes_used=torch.cuda.memory_allocated(),
+            )
+
+        # Attach loss values as span attributes for trace correlation
+        span.set_attribute("tasft.loss_total", loss.item())
+        span.set_attribute("tasft.step_duration_s", step_duration_s)
+        if loss_output is not None:
+            span.set_attribute("tasft.loss_task", loss_output.task.item())
+            span.set_attribute("tasft.loss_gate", loss_output.gate.item())
+            span.set_attribute("tasft.loss_sparse", loss_output.sparse.item())
 
     def _get_gate_warmup_multiplier(self, global_step: int) -> float:
         """Compute gate loss multiplier based on warmup schedule.

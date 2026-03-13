@@ -24,7 +24,10 @@ Preconditions:
 Postconditions:
     - Output: [B, H, S, D] same dtype as input
     - Numerically equivalent to dense attention on non-masked blocks
-    - Causal masking applied within and across blocks
+    - When causal=True: block-level lower-triangular mask is applied on the host,
+      AND within-block causal masking (q_idx >= k_idx) is applied inside the kernel.
+    - When causal=False: no causal masking at either block or element level;
+      only the user-supplied block_mask controls which blocks are computed.
 """
 
 from __future__ import annotations
@@ -38,12 +41,12 @@ import torch
 from torch.nn import functional
 
 from tasft.exceptions import KernelError
+from tasft.types import VALID_BLOCK_SIZES
 
 # ---------------------------------------------------------------------------
 # Backend detection
 # ---------------------------------------------------------------------------
 
-_VALID_BLOCK_SIZES = frozenset({32, 64, 128})
 _VALID_HEAD_DIMS = frozenset({64, 128})
 _EXPECTED_TENSOR_NDIM = 4
 
@@ -133,15 +136,16 @@ if HAS_TRITON:
         scale,
         BLOCK_SIZE: tl.constexpr,
         HEAD_DIM: tl.constexpr,
+        IS_CAUSAL: tl.constexpr,
     ):
-        """Triton kernel for block-sparse causal attention with online softmax.
+        """Triton kernel for block-sparse attention with online softmax.
 
         Grid: (B, H, num_q_blocks).
         Each program instance computes one query block's output by iterating
         over key blocks where the block mask is True.
 
         Uses the online softmax algorithm from FlashAttention for numerical
-        stability — maintains running max (m_i) and sum (l_i) accumulators,
+        stability -- maintains running max (m_i) and sum (l_i) accumulators,
         rescaling the output accumulator when a new max is encountered.
 
         Memory access pattern:
@@ -152,6 +156,12 @@ if HAS_TRITON:
         Numerical precision:
             - All accumulation in FP32 regardless of input dtype
             - Final output cast back to input dtype (BF16/FP16)
+
+        Causal behavior (controlled by IS_CAUSAL constexpr):
+            - IS_CAUSAL=True: within-block lower-triangular mask (q_idx >= k_idx)
+              is applied in addition to out-of-bounds masking.
+            - IS_CAUSAL=False: only out-of-bounds positions are masked; all valid
+              positions within an active block contribute to attention.
         """
         pid_b = tl.program_id(0)
         pid_h = tl.program_id(1)
@@ -217,14 +227,19 @@ if HAS_TRITON:
                 # QK^T: [BLOCK_SIZE, BLOCK_SIZE], scaled
                 qk = tl.dot(q, tl.trans(k)) * scale
 
-                # Causal mask: q_idx >= k_idx
+                # Positional indices for masking
                 q_indices = q_block_start + tl.arange(0, BLOCK_SIZE)
                 k_indices = k_block_start + tl.arange(0, BLOCK_SIZE)
-                causal_mask = q_indices[:, None] >= k_indices[None, :]
-                # Also mask out-of-bounds positions
+                # Out-of-bounds masking (always applied)
                 seq_mask_q = q_indices[:, None] < S
                 seq_mask_k = k_indices[None, :] < S
-                combined_mask = causal_mask & seq_mask_q & seq_mask_k
+                if IS_CAUSAL:
+                    # Causal mask: q_idx >= k_idx, combined with bounds
+                    causal_mask = q_indices[:, None] >= k_indices[None, :]
+                    combined_mask = causal_mask & seq_mask_q & seq_mask_k
+                else:
+                    # Non-causal: only mask out-of-bounds positions
+                    combined_mask = seq_mask_q & seq_mask_k
                 qk = tl.where(combined_mask, qk, float("-inf"))
 
                 # Online softmax update: rescale existing accumulators
@@ -309,9 +324,9 @@ class BlockSparseFlashAttention:
         min_sparsity_for_speedup: float = 0.5,
         backend: KernelBackend = KernelBackend.AUTO,
     ) -> None:
-        if block_size not in _VALID_BLOCK_SIZES:
+        if block_size not in VALID_BLOCK_SIZES:
             raise ValueError(
-                f"block_size must be one of {sorted(_VALID_BLOCK_SIZES)}, got {block_size}"
+                f"block_size must be one of {sorted(VALID_BLOCK_SIZES)}, got {block_size}"
             )
         if not 0.0 <= min_sparsity_for_speedup <= 1.0:
             raise ValueError(
@@ -449,7 +464,10 @@ class BlockSparseFlashAttention:
         Args:
             q, k, v: [B, H, S, D] contiguous CUDA tensors.
             block_mask: [B, H, NB_q, NB_k] boolean CUDA tensor.
-            causal: Whether to apply causal masking within blocks.
+            causal: Whether to apply causal masking. When True, block-level
+                lower-triangular masking is applied on the host AND within-block
+                causal masking (q_idx >= k_idx) is applied inside the kernel.
+                When False, neither is applied.
 
         Returns:
             Output tensor [B, H, S, D].
@@ -528,6 +546,7 @@ class BlockSparseFlashAttention:
             scale,
             BLOCK_SIZE=self.block_size,
             HEAD_DIM=D,
+            IS_CAUSAL=causal,
         )
 
         return out
