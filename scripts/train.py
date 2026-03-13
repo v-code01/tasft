@@ -316,7 +316,11 @@ def _prepare_dataset(cfg: dict[str, Any], tokenizer: Any, max_seq_length: int) -
 
     def tokenize_fn(examples: dict[str, list[Any]]) -> dict[str, list[Any]]:
         if template is not None:
-            texts = [template.format(**{k: examples[k][i] for k in examples}) for i in range(len(next(iter(examples.values()))))]
+            n_examples = len(next(iter(examples.values())))
+            texts = [
+                template.format(**{k: examples[k][i] for k in examples})
+                for i in range(n_examples)
+            ]
         else:
             texts = examples[text_col]
 
@@ -500,19 +504,27 @@ def train(
 
         logger.info("bundle_export_started", bundle_dir=str(bundle_dir))
 
-        from tasft.bundle.exporter import BundleExporter
+        from tasft.bundle.export import BundleExporter, ExportConfig
 
-        exporter = BundleExporter.from_checkpoint(
-            checkpoint_dir=actual_output_dir / "final",
-            training_config=cfg,
-            merge_lora=True,
+        model_cfg = cfg.get("model", {})
+        export_config = ExportConfig(
+            model_name=model_cfg.get("model_name", model_cfg.get("base_model_id", "unknown")),
+            base_model_id=model_cfg.get("base_model_id", "unknown"),
+            domain=cfg.get("domain", "general"),
+            block_size=cfg.get("gate", {}).get("block_size", 64),
+            global_threshold=cfg.get("gate", {}).get("default_threshold", 0.5),
         )
-        manifest = exporter.export(output_dir=bundle_dir)
+        exporter = BundleExporter(config=export_config)
+        bundle_path = exporter.export(
+            model=model,
+            output_dir=bundle_dir,
+        )
+        metadata = BundleExporter.load_bundle_metadata(bundle_path)
         logger.info(
             "bundle_export_completed",
-            bundle_dir=str(bundle_dir),
-            total_size_bytes=manifest.total_size_bytes,
-            num_files=len(manifest.file_checksums),
+            bundle_dir=str(bundle_path),
+            total_size_bytes=metadata.manifest.total_size_bytes,
+            num_files=len(metadata.manifest.checksums),
         )
 
     # Finalize WandB
@@ -524,7 +536,8 @@ def train(
     except ImportError:
         pass
 
-    logger.info("training_session_ended", elapsed_seconds=round(time.perf_counter() - start_time, 1))
+    total_elapsed = round(time.perf_counter() - start_time, 1)
+    logger.info("training_session_ended", elapsed_seconds=total_elapsed)
 
 
 if __name__ == "__main__":

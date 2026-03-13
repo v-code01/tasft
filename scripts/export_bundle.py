@@ -125,30 +125,64 @@ def export(
     # Deferred imports for heavy dependencies
     import torch
 
-    from tasft.bundle.exporter import BundleExporter
+    from tasft.bundle.export import BundleExporter, ExportConfig
 
-    # Load model and gates from checkpoint
-    logger.info("loading_checkpoint", checkpoint=str(checkpoint))
-
-    exporter = BundleExporter.from_checkpoint(
-        checkpoint_dir=checkpoint,
-        training_config=cfg,
-        merge_lora=merge_lora,
+    # Build export config from training config
+    model_cfg = cfg.get("model", {})
+    gate_cfg = cfg.get("gate", {})
+    export_config = ExportConfig(
+        model_name=model_cfg.get("model_name", model_cfg.get("base_model_id", "unknown")),
+        base_model_id=model_cfg.get("base_model_id", "unknown"),
+        domain=cfg.get("domain", "general"),
+        block_size=gate_cfg.get("block_size", 64),
+        global_threshold=gate_cfg.get("default_threshold", 0.5),
     )
 
+    # Load model from checkpoint
+    logger.info("loading_checkpoint", checkpoint=str(checkpoint))
+    from peft import PeftModel
+    from transformers import AutoModelForCausalLM
+
+    base_model_id = model_cfg.get("base_model_id")
+    if base_model_id:
+        base_model = AutoModelForCausalLM.from_pretrained(
+            base_model_id,
+            torch_dtype=torch.bfloat16,
+            device_map="auto",
+        )
+        model = PeftModel.from_pretrained(base_model, str(checkpoint))
+    else:
+        model = AutoModelForCausalLM.from_pretrained(
+            str(checkpoint),
+            torch_dtype=torch.bfloat16,
+            device_map="auto",
+        )
+
+    # Build eval summary if provided
+    eval_summary = None
+    if eval_summary_data is not None:
+        from tasft.bundle.bundle_schema import EvalSummary
+
+        eval_summary = EvalSummary(**eval_summary_data)
+
     # Run export
-    manifest = exporter.export(
+    exporter = BundleExporter(config=export_config)
+    bundle_path = exporter.export(
+        model=model,
         output_dir=output,
-        eval_summary=eval_summary_data,
+        eval_results=eval_summary,
     )
 
     elapsed_s = time.perf_counter() - start_time
+
+    metadata = BundleExporter.load_bundle_metadata(bundle_path)
+    manifest = metadata.manifest
 
     logger.info(
         "bundle_export_completed",
         output=str(output),
         total_size_bytes=manifest.total_size_bytes,
-        num_files=len(manifest.file_checksums),
+        num_files=len(manifest.checksums),
         num_layers=manifest.num_layers,
         elapsed_seconds=round(elapsed_s, 1),
     )
@@ -156,15 +190,13 @@ def export(
     # Verify bundle integrity
     if verify:
         logger.info("bundle_verification_started")
-        from tasft.bundle.exporter import BundleExporter
-
-        verification_result = BundleExporter.verify_bundle(output)
+        verification_result = BundleExporter.validate_bundle(bundle_path)
         if verification_result.is_valid:
-            logger.info("bundle_verification_passed", num_files=verification_result.files_checked)
+            logger.info("bundle_verification_passed", num_files=verification_result.checked_files)
         else:
             logger.error(
                 "bundle_verification_failed",
-                failures=verification_result.failures,
+                errors=verification_result.errors,
             )
             raise typer.Exit(code=1)
 
@@ -173,7 +205,7 @@ def export(
     typer.echo(f"  Model: {manifest.model_name}")
     typer.echo(f"  Base: {manifest.base_model_id}")
     typer.echo(f"  Layers: {manifest.num_layers}")
-    typer.echo(f"  Files: {len(manifest.file_checksums)}")
+    typer.echo(f"  Files: {len(manifest.checksums)}")
     typer.echo(f"  Size: {manifest.total_size_bytes / (1024**3):.2f} GB")
     typer.echo(f"  Time: {elapsed_s:.1f}s")
 
