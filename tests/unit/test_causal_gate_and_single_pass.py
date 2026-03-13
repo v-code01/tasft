@@ -534,8 +534,8 @@ class TestTrainingForwardFallback:
         with torch.enable_grad():
             output = tasft_attn(hidden_states)
 
-        # Output is a tuple (attn_output, attn_weights, past_kv)
-        assert len(output) == 3
+        # Output is a 2-tuple (attn_output, attn_weights) when use_cache=False
+        assert len(output) == 2
         attn_output = output[0]
         assert attn_output.shape == (1, 16, hidden_dim), (
             f"Fallback output shape {attn_output.shape} != expected (1, 16, {hidden_dim})"

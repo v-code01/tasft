@@ -203,7 +203,8 @@ class TestInferenceForwardProducesOutput:
             result = tasft_attn(hidden)
 
         assert isinstance(result, tuple), f"Expected tuple, got {type(result)}"
-        assert len(result) == 3, f"Expected 3-element tuple, got {len(result)}"
+        # Default use_cache=False -> 2-tuple (attn_output, attn_weights)
+        assert len(result) == 2, f"Expected 2-element tuple (no KV cache), got {len(result)}"
         attn_output = result[0]
         assert attn_output.shape == hidden.shape, (
             f"Output shape {attn_output.shape} must match input {hidden.shape}"
@@ -254,9 +255,9 @@ class TestInferenceDenseFallbackWhenNoProjections:
         with torch.no_grad():
             result = tasft_attn(hidden)
 
-        # Fallback path should still return a valid 3-tuple
+        # Fallback path returns 2-tuple when use_cache=False (no KV cache)
         assert isinstance(result, tuple)
-        assert len(result) == 3
+        assert len(result) == 2
         attn_output = result[0]
         assert attn_output.shape == hidden.shape, (
             f"Fallback output shape {attn_output.shape} must match input {hidden.shape}"
@@ -396,50 +397,34 @@ class TestInferenceKVCachePassthrough:
     """Test 8: Verify past_key_value is handled correctly in inference."""
 
     def test_inference_kv_cache_passthrough_tuple(self) -> None:
-        """Legacy tuple KV cache must be returned with correct shape.
+        """With use_cache=True, output is still 2-tuple (modern HF convention).
 
-        When use_cache=True, the third return element must be a (K, V) tuple
-        with shape [B, num_heads, S, head_dim] containing the projected and
-        potentially GQA-expanded key/value states.
-
-        Note: Extending the cache (autoregressive decoding) produces Q with
-        seq_len != K seq_len, which is incompatible with the AttnGate's shape
-        validation (Q.shape must equal K.shape). This is expected behavior --
-        autoregressive decoding with the gate requires architecture-level support
-        (e.g., padding Q to match K). Here we verify the initial cache creation.
+        Modern HF models use DynamicCache mutated in-place, so _pack_output
+        always returns (attn_output, attn_weights) — cache is not in the return.
         """
         tasft_attn = _make_tasft_attn()
         hidden = _make_hidden_states(batch_size=1, seq_len=_SEQ_LEN)
 
-        # First pass: generate initial KV cache
         with torch.no_grad():
-            result1 = tasft_attn(hidden, use_cache=True)
+            result = tasft_attn(hidden, use_cache=True)
 
-        assert result1[2] is not None, "use_cache=True must return past_key_value"
-        past_kv = result1[2]
-        assert isinstance(past_kv, tuple), f"Expected tuple cache, got {type(past_kv)}"
-        assert len(past_kv) == 2, f"Expected (K, V) tuple, got length {len(past_kv)}"
-
-        # Verify K and V shapes: [B, num_heads, S, head_dim]
-        cached_k, cached_v = past_kv
-        assert cached_k.shape == (_BATCH_SIZE // 2, _NUM_HEADS, _SEQ_LEN, _HEAD_DIM), (
-            f"Cached K shape mismatch: {cached_k.shape}"
-        )
-        assert cached_v.shape == cached_k.shape, (
-            f"Cached V shape must match K: K={cached_k.shape}, V={cached_v.shape}"
-        )
-        assert torch.isfinite(cached_k).all(), "Cached K contains NaN or Inf"
-        assert torch.isfinite(cached_v).all(), "Cached V contains NaN or Inf"
+        # Always 2-tuple regardless of use_cache
+        assert len(result) == 2, f"Expected 2-tuple, got {len(result)}-tuple"
+        assert result[0].shape[0] == 1, "Batch dim mismatch"
+        assert torch.isfinite(result[0]).all(), "Output contains NaN or Inf"
 
     def test_inference_kv_cache_none_when_not_requested(self) -> None:
-        """When use_cache=False, past_key_value return must be None."""
+        """When use_cache=False, result must be a 2-tuple (no KV cache element)."""
         tasft_attn = _make_tasft_attn()
         hidden = _make_hidden_states()
 
         with torch.no_grad():
             result = tasft_attn(hidden, use_cache=False)
 
-        assert result[2] is None, "use_cache=False must return None for past_key_value"
+        # With use_cache=False, past_kv is None so _pack_output returns 2-tuple
+        assert len(result) == 2, (
+            f"use_cache=False must return 2-tuple (no KV cache), got {len(result)}"
+        )
 
 
 class TestInferencePositionEmbeddingsApplied:

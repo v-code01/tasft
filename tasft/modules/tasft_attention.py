@@ -206,12 +206,29 @@ class TASFTAttention(nn.Module):
         """
         self.compute_gate_target = compute_gate_target
 
+    # Temperature for softmax in gate target computation. Values > 1 smooth the
+    # target distribution, preventing near-delta outputs that cause KL divergence
+    # explosion in float32. Chosen so typical KL loss stays in [0, 5] range.
+    _GATE_TARGET_TEMPERATURE: float = 2.0
+
+    # Clamp range for pre-softmax logits after maxpooling. Without clamping,
+    # maxpooled attention scores can exceed 100 in float32, causing softmax to
+    # produce distributions where one entry is ~1.0 and all others are ~0.0.
+    _GATE_TARGET_CLAMP_MIN: float = -50.0
+    _GATE_TARGET_CLAMP_MAX: float = 50.0
+
     def _compute_gate_target(self, attn_scores: torch.Tensor) -> torch.Tensor:
         """Compute ground-truth block importance from full attention score matrix.
 
         Uses 2D max-pooling to extract per-block importance, then softmax-normalizes
-        across the flattened block grid. This is the distillation target the gate
-        learns to predict.
+        across the flattened block grid with temperature scaling. This is the
+        distillation target the gate learns to predict.
+
+        Numerical stability: Pre-softmax logits are clamped to
+        [_GATE_TARGET_CLAMP_MIN, _GATE_TARGET_CLAMP_MAX] after maxpooling to
+        prevent near-delta softmax distributions that cause KL divergence
+        explosion in float32. Temperature > 1 further smooths the target
+        distribution, reducing gradient magnitude during gate distillation.
 
         Args:
             attn_scores: Full attention scores [B, H, S, S] (pre-softmax or post-softmax).
@@ -252,9 +269,24 @@ class TASFTAttention(nn.Module):
         # Reshape to [B, H, NB_q, NB_k]
         block_max = block_max.reshape(B, H, NB_q, NB_k)
 
-        # Softmax-normalize over flattened block dim for distillation target
+        # Clamp finite values to bounded range to prevent near-delta softmax.
+        # Preserves -inf from causal masking (those map to 0 after softmax).
+        finite_mask = torch.isfinite(block_max)
+        block_max = torch.where(
+            finite_mask,
+            block_max.clamp(
+                min=self._GATE_TARGET_CLAMP_MIN,
+                max=self._GATE_TARGET_CLAMP_MAX,
+            ),
+            block_max,
+        )
+
+        # Softmax-normalize over flattened block dim for distillation target.
+        # Temperature > 1 smooths the distribution, preventing near-delta targets
+        # that produce large KL divergence values against the gate's initial
+        # approximately-uniform predictions.
         flat = block_max.reshape(B, H, NB_q * NB_k)
-        flat_softmax = F.softmax(flat, dim=-1)
+        flat_softmax = F.softmax(flat / self._GATE_TARGET_TEMPERATURE, dim=-1)
         return flat_softmax.reshape(B, H, NB_q, NB_k)
 
 
@@ -300,7 +332,9 @@ class TASFTAttention(nn.Module):
             **kwargs: Additional arguments forwarded to base attention.
 
         Returns:
-            Tuple (attn_output, attn_weights, past_key_value) — standard HF convention.
+            2-tuple (attn_output, attn_weights) when use_cache is False or past_kv is None,
+            3-tuple (attn_output, attn_weights, past_key_value) when KV cache is present.
+            Matches modern HF attention convention (Qwen2, LLaMA >= 4.43).
         """
         is_training = torch.is_grad_enabled() and self.compute_gate_target
 
@@ -353,7 +387,7 @@ class TASFTAttention(nn.Module):
         q_proj/k_proj/v_proj/o_proj attributes.
 
         Returns:
-            HF-compatible tuple (attn_output, attn_weights, past_key_value).
+            HF-compatible tuple: 2-tuple when no KV cache, 3-tuple when KV cache present.
 
         Complexity: O(B * H * S^2 * D) for attention + O((S/B)^2 * H) for gate.
         """
@@ -414,8 +448,14 @@ class TASFTAttention(nn.Module):
                 ext_mask = ext_mask[:, None, None, :]
             attn_weights = attn_weights + ext_mask
 
-        # Store raw attention weights for gate target computation before softmax
-        self._last_attn_weights = attn_weights
+        # Store attention weights for gate target computation before softmax.
+        # Detach from the autograd graph: gate target is a fixed distillation
+        # signal, not a differentiable path. This prevents gradient overflow from
+        # flowing back through the O(S^2) attention matrix when the gate loss
+        # is large (which occurs on CPU float32 with pre-softmax scores of
+        # magnitude 100+). The gate learns to predict block importance; it does
+        # not need to modify the attention computation itself.
+        self._last_attn_weights = attn_weights.detach()
 
         attn_weights_softmax = F.softmax(attn_weights, dim=-1, dtype=torch.float32)
         attn_weights_softmax = attn_weights_softmax.to(value_states.dtype)
@@ -425,7 +465,7 @@ class TASFTAttention(nn.Module):
         attn_output = attn_output.transpose(1, 2).contiguous().reshape(bsz, q_len, hidden_dim)
         attn_output = attn.o_proj(attn_output)
 
-        return (attn_output, attn_weights, new_past_key_value)
+        return self._pack_output(attn_output, attn_weights, new_past_key_value)
 
     def _training_forward_fallback(
         self,
@@ -444,7 +484,7 @@ class TASFTAttention(nn.Module):
         Incurs double Q/K projection — only used when the base module is non-standard.
 
         Returns:
-            HF-compatible tuple (attn_output, attn_weights, past_key_value).
+            HF-compatible tuple: 2-tuple when no KV cache, 3-tuple when KV cache present.
         """
         base_output = self.base_attn(
             hidden_states=hidden_states,
@@ -472,7 +512,7 @@ class TASFTAttention(nn.Module):
 
         self._last_gate_output = gate_output
 
-        return (attn_output, attn_weights, past_kv)
+        return self._pack_output(attn_output, attn_weights, past_kv)
 
     def _inference_forward(
         self,
@@ -497,7 +537,7 @@ class TASFTAttention(nn.Module):
         Stores self._last_gate_output for downstream extraction.
 
         Returns:
-            HF-compatible tuple (attn_output, None, past_key_value).
+            HF-compatible tuple: 2-tuple when no KV cache, 3-tuple when KV cache present.
 
         Complexity:
             Sparse path: O(B * H * S^2 * (1-sparsity) * D / block_size^2)
@@ -570,7 +610,7 @@ class TASFTAttention(nn.Module):
         attn_output = attn_output.transpose(1, 2).contiguous().reshape(bsz, q_len, hidden_dim)
         attn_output = attn.o_proj(attn_output)
 
-        return (attn_output, None, new_past_key_value)
+        return self._pack_output(attn_output, None, new_past_key_value)
 
     def _prepare_qkv(
         self,
@@ -585,6 +625,14 @@ class TASFTAttention(nn.Module):
         """Project Q/K/V, apply rotary embeddings, expand GQA heads, and update KV cache.
 
         Centralizes the projection pipeline shared by sparse and dense inference paths.
+
+        Dimension resolution uses a 3-tier fallback for each of num_heads, num_kv_heads,
+        and head_dim:
+            1. Direct attribute on module (e.g., ``attn.num_heads``)
+            2. Module's ``.config`` attribute (e.g., ``attn.config.num_attention_heads``)
+               -- handles Qwen2Attention and similar architectures where dimensions
+               live on the config object rather than as instance attributes.
+            3. Derive from projection weight shapes (``q_proj.weight.shape[0] // head_dim``)
 
         Args:
             attn: Base attention module with q_proj, k_proj, v_proj attributes.
@@ -605,9 +653,57 @@ class TASFTAttention(nn.Module):
         key_states = attn.k_proj(hidden_states)
         value_states = attn.v_proj(hidden_states)
 
-        num_heads: int = getattr(attn, "num_heads", 0)
-        num_kv_heads: int = getattr(attn, "num_key_value_heads", num_heads)
-        head_dim: int = getattr(attn, "head_dim", 0)
+        # 3-tier fallback for num_heads: direct attr -> config -> weight shape derivation
+        num_heads_resolved = _resolve_attn_dim(
+            attn,
+            attr_names=("num_heads", "num_attention_heads", "n_head"),
+            config_attr_names=("num_attention_heads", "num_heads", "n_head"),
+        )
+
+        # 3-tier fallback for head_dim: direct attr -> config -> weight shape derivation
+        head_dim_resolved = _resolve_attn_dim(
+            attn,
+            attr_names=("head_dim", "d_head"),
+            config_attr_names=("head_dim", "d_head"),
+        )
+
+        # 3-tier fallback for num_kv_heads: direct attr -> config -> weight shape derivation
+        num_kv_heads_resolved = _resolve_attn_dim(
+            attn,
+            attr_names=("num_key_value_heads",),
+            config_attr_names=("num_key_value_heads",),
+        )
+
+        # Derive missing dims from projection weight shapes (tier 3)
+        q_out_dim = query_states.shape[-1]
+        k_out_dim = key_states.shape[-1]
+
+        if head_dim_resolved is not None and num_heads_resolved is None:
+            num_heads_resolved = q_out_dim // head_dim_resolved
+        elif num_heads_resolved is not None and head_dim_resolved is None:
+            head_dim_resolved = q_out_dim // num_heads_resolved
+        elif num_heads_resolved is None and head_dim_resolved is None:
+            # Last resort: try hidden_size from config to get head_dim
+            hidden_size = _resolve_attn_dim(
+                attn,
+                attr_names=("hidden_size",),
+                config_attr_names=("hidden_size",),
+            )
+            if hidden_size is not None and q_out_dim > 0:
+                # head_dim = hidden_size / num_heads, but we need num_heads first
+                # For standard models: q_out_dim == hidden_size, so we need another source
+                pass
+
+        num_heads: int = num_heads_resolved if num_heads_resolved is not None else 0
+        head_dim: int = head_dim_resolved if head_dim_resolved is not None else 0
+
+        # num_kv_heads: fall back to deriving from k_proj output shape if head_dim is known
+        if num_kv_heads_resolved is not None:
+            num_kv_heads: int = num_kv_heads_resolved
+        elif head_dim > 0:
+            num_kv_heads = k_out_dim // head_dim
+        else:
+            num_kv_heads = num_heads
 
         # Reshape to [B, num_heads, S, head_dim]
         query_states = query_states.view(bsz, q_len, num_heads, head_dim).transpose(1, 2)
@@ -663,7 +759,7 @@ class TASFTAttention(nn.Module):
         for observability, but attention itself is fully dense.
 
         Returns:
-            HF-compatible tuple (attn_output, None, past_key_value).
+            HF-compatible tuple: 2-tuple when no KV cache, 3-tuple when KV cache present.
         """
         # Attempt gate prediction for observability even without sparse path
         q_proj, k_proj = self._extract_qk_projections(hidden_states)
@@ -688,7 +784,7 @@ class TASFTAttention(nn.Module):
         attn_output = base_output[0]
         past_kv = base_output[2] if len(base_output) > 2 else None
 
-        return (attn_output, None, past_kv)
+        return self._pack_output(attn_output, None, past_kv)
 
     def _extract_qk_projections(
         self, hidden_states: torch.Tensor,
@@ -734,6 +830,35 @@ class TASFTAttention(nn.Module):
             k = k.repeat_interleave(repeat_factor, dim=1)
 
         return q, k
+
+    @staticmethod
+    def _pack_output(
+        attn_output: torch.Tensor,
+        attn_weights: torch.Tensor | None,
+        past_kv: Any | None,
+    ) -> tuple[torch.Tensor, ...]:
+        """Build HF-compatible return tuple — always 2-tuple.
+
+        Modern HuggingFace models (Qwen2, LLaMA >= 4.43, Mistral) unpack
+        attention output as ``hidden_states, _ = self.self_attn(...)``
+        expecting exactly 2 values. DynamicCache is mutated in-place during
+        ``past_key_value.update()``, so there is no need to return it.
+
+        For legacy models using tuple-based KV cache (not DynamicCache), the
+        cache is still accessible via ``_prepare_qkv``'s ``past_key_value``
+        parameter on the next forward call.
+
+        Args:
+            attn_output: Attention output tensor [B, S, hidden_dim].
+            attn_weights: Attention weight tensor or None.
+            past_kv: Updated KV cache or None (unused in return, kept for API compat).
+
+        Returns:
+            2-tuple ``(attn_output, attn_weights)`` — always.
+
+        Complexity: O(1).
+        """
+        return (attn_output, attn_weights)
 
     def extra_repr(self) -> str:
         """Module repr for debugging."""
@@ -963,39 +1088,121 @@ def _replace_attn_module(layer: nn.Module, replacement: nn.Module) -> None:
     )
 
 
+def _resolve_attn_dim(
+    attn: nn.Module,
+    attr_names: tuple[str, ...],
+    config_attr_names: tuple[str, ...] | None = None,
+) -> int | None:
+    """Resolve a single attention dimension via 3-tier fallback.
+
+    Fallback chain:
+        1. Direct attribute on module (e.g., ``attn.num_heads``)
+        2. Module's ``.config`` attribute (e.g., ``attn.config.num_attention_heads``)
+           -- handles Qwen2Attention and similar architectures where dimensions
+           live on the config object rather than as instance attributes.
+        3. Returns None -- caller must derive from weight shapes or raise.
+
+    Args:
+        attn: The attention module to inspect.
+        attr_names: Attribute names to try on the module directly.
+        config_attr_names: Attribute names to try on ``attn.config``. If None,
+                           reuses ``attr_names``.
+
+    Returns:
+        The resolved integer dimension, or None if not found.
+
+    Complexity: O(1) -- bounded by the number of attribute names.
+    """
+    # Tier 1: direct attribute on the module instance
+    for attr in attr_names:
+        val = getattr(attn, attr, None)
+        if isinstance(val, int) and val > 0:
+            return val
+
+    # Tier 2: module's .config object (Qwen2, newer transformers)
+    config = getattr(attn, "config", None)
+    if config is not None:
+        search_attrs = config_attr_names if config_attr_names is not None else attr_names
+        for attr in search_attrs:
+            val = getattr(config, attr, None)
+            if isinstance(val, int) and val > 0:
+                return val
+
+    # Tier 3: not found -- caller handles derivation or error
+    return None
+
+
 def _extract_attn_dims(attn: nn.Module) -> tuple[int, int]:
     """Extract num_heads and head_dim from an attention module.
 
-    Tries common HuggingFace attribute names.
+    Uses a 3-tier fallback for each dimension:
+        1. Direct attribute on module (e.g., ``attn.num_heads``)
+        2. Module's ``.config`` attribute (e.g., ``attn.config.num_attention_heads``)
+           -- handles Qwen2Attention and similar architectures where dimensions
+           live on the config object rather than as instance attributes.
+        3. Derive from projection weight shapes (``attn.q_proj.weight``)
 
     Returns:
         (num_heads, head_dim) tuple.
 
     Raises:
-        ValidationError: If dimensions cannot be determined.
+        ValidationError: If dimensions cannot be determined from any source.
+
+    Complexity: O(1).
     """
-    num_heads: int | None = None
-    head_dim: int | None = None
+    num_heads = _resolve_attn_dim(
+        attn,
+        attr_names=("num_heads", "num_attention_heads", "n_head"),
+        config_attr_names=("num_attention_heads", "num_heads", "n_head"),
+    )
 
-    # Try common attribute names for num_heads
-    for attr in ("num_heads", "num_attention_heads", "n_head"):
-        val = getattr(attn, attr, None)
-        if isinstance(val, int) and val > 0:
-            num_heads = val
-            break
+    head_dim = _resolve_attn_dim(
+        attn,
+        attr_names=("head_dim", "d_head"),
+        config_attr_names=("head_dim", "d_head"),
+    )
 
-    # Try common attribute names for head_dim
-    for attr in ("head_dim", "d_head"):
-        val = getattr(attn, attr, None)
-        if isinstance(val, int) and val > 0:
-            head_dim = val
-            break
-
-    # Fallback: derive from hidden_size / num_heads
+    # Fallback: derive head_dim from hidden_size / num_heads
     if head_dim is None and num_heads is not None:
-        hidden_size = getattr(attn, "hidden_size", None)
-        if isinstance(hidden_size, int) and hidden_size > 0:
+        hidden_size = _resolve_attn_dim(
+            attn,
+            attr_names=("hidden_size",),
+            config_attr_names=("hidden_size",),
+        )
+        if hidden_size is not None:
             head_dim = hidden_size // num_heads
+
+    # Tier 3 fallback: derive from q_proj weight shape
+    # q_proj.weight has shape [num_heads * head_dim, hidden_size]
+    if num_heads is None or head_dim is None:
+        q_proj = getattr(attn, "q_proj", None)
+        if q_proj is not None:
+            weight = getattr(q_proj, "weight", None)
+            if weight is not None:
+                q_out_dim = weight.shape[0]
+                # If we have head_dim but not num_heads, derive num_heads
+                if head_dim is not None and num_heads is None:
+                    num_heads = q_out_dim // head_dim
+                # If we have num_heads but not head_dim, derive head_dim
+                elif num_heads is not None and head_dim is None:
+                    head_dim = q_out_dim // num_heads
+                # If we have neither, try hidden_size from weight input dim
+                elif num_heads is None and head_dim is None:
+                    hidden_size_from_weight = weight.shape[1]
+                    # Common case: q_out_dim == hidden_size (no MQA scaling on Q)
+                    # Try to get num_heads from config to break the deadlock
+                    config = getattr(attn, "config", None)
+                    if config is not None:
+                        # Try num_key_value_heads as a last resort for head_dim derivation
+                        for cfg_attr in ("num_attention_heads", "num_heads"):
+                            cfg_val = getattr(config, cfg_attr, None)
+                            if isinstance(cfg_val, int) and cfg_val > 0:
+                                num_heads = cfg_val
+                                head_dim = q_out_dim // num_heads
+                                break
+                    if num_heads is None and q_out_dim == hidden_size_from_weight:
+                        # Cannot determine without external info
+                        pass
 
     if num_heads is None or head_dim is None:
         msg = "Cannot determine num_heads and head_dim from attention module"

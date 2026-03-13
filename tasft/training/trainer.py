@@ -426,12 +426,24 @@ class TASFTTrainer(Trainer):
                     active_layer_indices=list(gate_outputs_by_layer.keys()),
                     block_size=self._tasft_args.block_size,
                 )
+                # Clamp gate loss to prevent gradient explosion in float32.
+                # Unclamped KL divergence between near-delta gate targets and
+                # approximately-uniform gate predictions can reach 30-50, which
+                # when multiplied by lambda_gate and backpropagated produces
+                # NaN gradients. Capping at 10.0 bounds the effective gradient
+                # contribution while still providing a strong learning signal.
+                # The clamp uses straight-through: values above the cap still
+                # receive zero gradient from the clamp, acting as implicit
+                # gradient clipping on the loss itself.
+                clamped_gate_loss = torch.clamp(loss_output.gate, max=10.0)
+                clamped_sparse_loss = torch.clamp(loss_output.sparse, max=10.0)
+
                 # Scale gate component by warmup multiplier
                 loss = (
                     loss_output.task
                     + self._tasft_args.lambda_gate
                     * gate_warmup_multiplier
-                    * (loss_output.gate + self._tasft_args.beta_sparse * loss_output.sparse)
+                    * (clamped_gate_loss + self._tasft_args.beta_sparse * clamped_sparse_loss)
                 )
             else:
                 # No active gate outputs or in warmup cold phase — task loss only
@@ -489,6 +501,19 @@ class TASFTTrainer(Trainer):
             # (all base params frozen). Guard against backward on a non-differentiable tensor.
             if loss.requires_grad:
                 self.accelerator.backward(loss)
+
+                # Per-parameter gradient clipping for gate parameters.
+                # Gate gradients can be disproportionately large relative to LoRA
+                # gradients because the gate loss (KL divergence) operates in a
+                # different numerical regime than cross-entropy. Without separate
+                # clipping, global grad norm clipping may either be too loose for
+                # gates (allowing overflow) or too tight for LoRA (stalling task
+                # learning). Max norm of 1.0 for gate params keeps updates stable
+                # in float32 without affecting LoRA gradient flow.
+                gate_params = self._collect_gate_parameters()
+                gate_params_with_grad = [p for p in gate_params if p.grad is not None]
+                if gate_params_with_grad:
+                    torch.nn.utils.clip_grad_norm_(gate_params_with_grad, max_norm=1.0)
 
         return loss.detach()
 

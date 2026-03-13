@@ -896,7 +896,10 @@ class TestKVCache:
         return tasft, hidden_dim
 
     def test_dynamic_cache_interface(self) -> None:
-        """TASFTAttention works with DynamicCache.update() interface."""
+        """TASFTAttention works with DynamicCache.update() interface.
+
+        Modern HF uses DynamicCache mutated in-place — return is always 2-tuple.
+        """
         tasft, hidden_dim = self._build_tasft()
         B, S = 1, 32
         hidden = torch.randn(B, S, hidden_dim)
@@ -904,10 +907,10 @@ class TestKVCache:
         with torch.no_grad():
             output = tasft(hidden, past_key_value=cache, use_cache=True)
         assert output[0].shape == (B, S, hidden_dim)
-        # past_key_value returned for caching
-        assert output[2] is not None
-        cached_k, cached_v = output[2]
-        assert cached_k.shape[2] == S  # Sequence length in cache
+        # Always 2-tuple (cache is mutated in-place via DynamicCache.update)
+        assert len(output) == 2
+        # Verify the cache was mutated by checking it has stored K/V
+        assert len(cache._cache) > 0, "DynamicCache should have been updated"
 
     def test_legacy_tuple_cache(self) -> None:
         """Legacy (key, value) tuple cache concatenates K/V along sequence dim.

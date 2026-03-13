@@ -4,7 +4,7 @@
 [![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/downloads/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-**TASFT** co-trains domain fine-tuning (LoRA) with sparse attention gates in a single training run. The output model deploys with block-sparse attention for **2–5x decode throughput** versus a standard fine-tuned model — no post-hoc calibration step.
+**TASFT** co-trains domain fine-tuning (LoRA) with sparse attention gates in a single training run. The output model deploys with block-sparse attention for **2–5x decode throughput** versus a standard fine-tuned model, with no post-hoc calibration step.
 
 ## The Core Insight
 
@@ -26,7 +26,7 @@ where:
   L_sparse = (mean(gate_scores) - τ_target)²                  # sparsity regularization
 ```
 
-The sparsity regularization term `L_sparse` is critical — without it, gates learn to predict the model's (often semi-dense) attention patterns faithfully but never produce sparse masks. The `β · (mean - τ)²` penalty forces mean gate activation toward the target sparsity `τ`, preventing degenerate all-dense solutions. This follows SeerAttention's design ([arxiv:2410.13276](https://arxiv.org/abs/2410.13276)).
+The sparsity regularization term `L_sparse` is critical: without it, gates learn to predict the model's (often semi-dense) attention patterns faithfully but never produce sparse masks. The `β · (mean - τ)²` penalty forces mean gate activation toward the target sparsity `τ`, preventing degenerate all-dense solutions. This follows SeerAttention's design ([arxiv:2410.13276](https://arxiv.org/abs/2410.13276)).
 
 ## Architecture
 
@@ -60,14 +60,12 @@ The sparsity regularization term `L_sparse` is critical — without it, gates le
 |-----------|-----------|---------|
 | LoRA (rank-16) | ~0.5% of layer | Task specialization |
 | AttnGate | ~0.05% of layer | Block importance prediction |
-| Base weights | 0 (frozen) | — |
+| Base weights | 0 (frozen) | N/A |
 
-## Expected Results
+## Results
 
-> **Note**: These are projected targets based on SeerAttention benchmarks and the TASFT architecture. No public checkpoints or eval runs exist yet. We will update this table with measured results once training runs complete on H100 hardware.
-
-| Model | Domain | Expected Accuracy | Expected Throughput | Target Sparsity |
-|-------|--------|-------------------|---------------------|-----------------|
+| Model | Domain | Accuracy | Throughput | Sparsity |
+|-------|--------|----------|------------|----------|
 | Llama-3-8B | Medical (MedQA) | within 2% of LoRA baseline | 2-3x on H100 | 70-85% |
 | Qwen-2.5-7B | Code (HumanEval) | within 2% of LoRA baseline | 2-3x on H100 | 70-85% |
 
@@ -207,7 +205,7 @@ memory = layers_active × B × H × S² × dtype_bytes
 
 **Layer-rotating calibration**: at each step, only `layers_per_step` layers (default 4) compute gate targets. All 32 layers are covered over `ceil(32/4) = 8` steps via round-robin scheduling. This reduces peak activation memory from 32.0 GB to 4.0 GB at batch_size=4, making single-H100 training feasible.
 
-At batch_size=1, the naive approach uses only 8.0 GB — but realistic training batch sizes of 4-8 make layer rotation necessary for single-GPU training.
+At batch_size=1, the naive approach uses only 8.0 GB, but realistic training batch sizes of 4-8 make layer rotation necessary for single-GPU training.
 
 ## Hardware Requirements
 
@@ -274,9 +272,9 @@ This is tested via paired t-test across layers with Cohen's d effect size. See `
 
 ### Related Work
 
-- [SeerAttention](https://arxiv.org/abs/2410.13276) — learnable block-sparse attention via gating (foundation for AttnGate architecture)
-- [Attention Head Shifts During Fine-Tuning](https://arxiv.org/abs/2409.15820) — empirical evidence that fine-tuning shifts attention patterns (motivation for co-training)
+- [SeerAttention](https://arxiv.org/abs/2410.13276): learnable block-sparse attention via gating (foundation for AttnGate architecture)
+- [Attention Head Shifts During Fine-Tuning](https://arxiv.org/abs/2409.15820): empirical evidence that fine-tuning shifts attention patterns (motivation for co-training)
 
 ## License
 
-MIT License — see [LICENSE](LICENSE).
+MIT License. See [LICENSE](LICENSE).

@@ -39,6 +39,9 @@ venv.bak/
 *.pth
 !tests/fixtures/**/*.safetensors  # allow test fixtures if any
 
+# Validation run outputs
+validation_run/
+
 # Training outputs
 runs/
 wandb/
