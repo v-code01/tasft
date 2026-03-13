@@ -539,8 +539,13 @@ class GateQualityEvaluator:
             [posthoc.per_layer_kl[l] for l in common_layers], dtype=np.float64,
         )
 
-        # Paired t-test: H0: mean(posthoc_kl - cotrained_kl) = 0
-        _t_stat, p_value = stats.ttest_rel(posthoc_kls, cotrained_kls)
+        # One-tailed paired t-test: H1: mean(posthoc_kl) > mean(cotrained_kl)
+        # Using alternative='greater' because our directional hypothesis is that
+        # post-hoc gates have higher KL than co-trained gates. A two-tailed test
+        # would halve power by testing the irrelevant reverse direction.
+        _t_stat, p_value = stats.ttest_rel(
+            posthoc_kls, cotrained_kls, alternative="greater",
+        )
 
         # Per-layer improvement: positive means cotrained is better
         per_layer_improvement = {

@@ -92,6 +92,7 @@ class TASFTvLLMAttentionBackend(nn.Module):
         self.num_kv_heads = num_kv_heads
         self.head_dim = head_dim
         self._kernel: Any | None = None
+        self._original_forward: Any | None = None  # Set during patching for decode delegation
 
     def _get_kernel(self) -> Any:
         """Lazy-load BlockSparseFlashAttention kernel.
@@ -187,8 +188,15 @@ class TASFTvLLMAttentionBackend(nn.Module):
     ) -> torch.Tensor:
         """Dense attention fallback for single-token decode steps.
 
-        During autoregressive decode, each step generates 1 token, so there is
-        no block-level sparsity benefit. Falls back to standard scaled dot-product.
+        During autoregressive decode, each step generates 1 token attending to
+        the full cached KV context via PagedAttention. No block-level sparsity
+        benefit exists at S=1, so we delegate to the original vLLM forward which
+        correctly handles the paged KV cache.
+
+        CRITICAL: We must use the original vLLM forward here because it manages
+        PagedAttention lookups into kv_cache using attn_metadata slot mappings.
+        Computing attention only on the current token's Q/K (ignoring the cache)
+        would produce garbage output during autoregressive generation.
 
         Args:
             query: [num_tokens, num_heads * head_dim] flat query.
@@ -202,6 +210,21 @@ class TASFTvLLMAttentionBackend(nn.Module):
 
         Complexity: O(num_tokens * num_heads * cached_seq_len * head_dim).
         """
+        if self._original_forward is not None:
+            # Delegate to vLLM's original attention which handles PagedAttention
+            # and correctly attends to the full cached KV context
+            return self._original_forward(
+                query, key, value, kv_cache=kv_cache, attn_metadata=attn_metadata,
+            )
+
+        # Fallback: if original forward not available (should not happen in
+        # properly patched setup), compute basic SDPA as last resort.
+        # This path only produces correct results when kv_cache is empty.
+        logger.warning(
+            "[VLLM_DECODE_FALLBACK] No original forward available for decode; "
+            "output may be incorrect if KV cache is populated",
+            layer_idx=self.layer_idx,
+        )
         num_tokens = query.shape[0]
         q = query.view(num_tokens, self.num_heads, self.head_dim)
         k = key.view(num_tokens, self.num_kv_heads, self.head_dim)
@@ -213,7 +236,7 @@ class TASFTvLLMAttentionBackend(nn.Module):
             k = k.repeat_interleave(n_rep, dim=1)
             v = v.repeat_interleave(n_rep, dim=1)
 
-        # Standard scaled dot-product for decode
+        # Standard scaled dot-product — only correct when no cached context
         scale = 1.0 / (self.head_dim**0.5)
         attn_weights = torch.einsum("thd,shd->ths", q * scale, k)
         attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32)
@@ -420,10 +443,11 @@ def patch_vllm_attention(
                 head_dim=head_dim,
             )
 
-            # Patch the attention module's forward method
-            # Store original for potential rollback
+            # Store original forward on both the module (for rollback) and
+            # the backend (for decode delegation to PagedAttention)
             vllm_attn._tasft_original_forward = vllm_attn.forward  # type: ignore[attr-defined]
             vllm_attn._tasft_backend = backend  # type: ignore[attr-defined]
+            backend._original_forward = vllm_attn.forward
 
             # Replace forward with TASFT sparse version
             def _make_patched_forward(
@@ -503,6 +527,13 @@ def unpatch_vllm_attention(vllm_worker: Any) -> None:
         elif hasattr(vllm_worker, "model"):
             worker_model = vllm_worker.model
         else:
+            # Unrecognized worker type — still reset patch state so
+            # a subsequent patch_vllm_attention call can re-apply
+            _patch_applied = False
+            logger.warning(
+                "[VLLM_UNPATCH] Unrecognized worker type, reset patch state only",
+                worker_type=type(vllm_worker).__name__,
+            )
             return
 
         for _name, module in worker_model.named_modules():
