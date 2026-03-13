@@ -36,6 +36,8 @@ from tasft.types import (
     LayerIndex,
 )
 
+_KERNEL_NOT_TRIED = object()
+
 
 @dataclass(frozen=True)
 class GateConfig:
@@ -127,6 +129,7 @@ class TASFTAttention(nn.Module):
         gate: AttnGate,
         layer_idx: LayerIndex,
         compute_gate_target: bool = False,
+        min_sparsity_for_speedup: float = 0.3,
     ) -> None:
         """Initialize TASFTAttention wrapper.
 
@@ -135,17 +138,63 @@ class TASFTAttention(nn.Module):
             gate: AttnGate module for this layer.
             layer_idx: Index of this layer in the model.
             compute_gate_target: Whether to compute gate distillation targets from full attn.
+            min_sparsity_for_speedup: Minimum gate sparsity ratio to use the block-sparse
+                kernel. Below this threshold, dense SDPA is used instead since the kernel
+                overhead exceeds the savings from skipping few blocks. Must be in [0, 1].
+
+        Raises:
+            ValidationError: If min_sparsity_for_speedup is outside [0, 1].
         """
         super().__init__()
+        if not 0.0 <= min_sparsity_for_speedup <= 1.0:
+            msg = f"min_sparsity_for_speedup must be in [0, 1], got {min_sparsity_for_speedup}"
+            raise ValidationError(
+                msg,
+                context={"min_sparsity_for_speedup": min_sparsity_for_speedup},
+            )
+
         self.base_attn = base_attn
         self.gate = gate
         self.layer_idx = layer_idx
         self.compute_gate_target = compute_gate_target
+        self.min_sparsity_for_speedup = min_sparsity_for_speedup
 
         # Mutable instance attributes for trainer extraction after forward pass.
         # Set during forward(), read by TASFTTrainer._extract_gate_output/attn_scores.
         self._last_gate_output: GateOutput | None = None
         self._last_attn_weights: AttentionScores | None = None
+
+        # Lazy-loaded block-sparse kernel. Three states:
+        #   _KERNEL_NOT_TRIED: not yet attempted to load
+        #   None: attempted but unavailable (import error, unsupported block_size, etc.)
+        #   <instance>: successfully loaded kernel
+        self._kernel: Any = _KERNEL_NOT_TRIED
+
+    def _get_kernel(self) -> Any | None:
+        """Lazy-load BlockSparseFlashAttention kernel.
+
+        Returns:
+            BlockSparseFlashAttention instance, or None if the kernel is unavailable
+            (missing dependency, unsupported block_size, no GPU, etc.).
+
+        Complexity: O(1) after first call.
+        """
+        if self._kernel is not _KERNEL_NOT_TRIED:
+            return self._kernel
+        try:
+            if not torch.cuda.is_available():
+                # Block-sparse kernel requires CUDA; skip on CPU-only
+                self._kernel = None
+                return self._kernel
+            from tasft.kernels.block_sparse_fa import BlockSparseFlashAttention
+
+            self._kernel = BlockSparseFlashAttention(block_size=self.gate.block_size)
+        except (ImportError, ValueError, RuntimeError):
+            # ImportError: triton/CUDA not available
+            # ValueError: unsupported block_size
+            # RuntimeError: GPU not available
+            self._kernel = None
+        return self._kernel
 
     def set_training_mode(self, compute_gate_target: bool) -> None:
         """Toggle gate target computation for training vs inference.
@@ -350,27 +399,194 @@ class TASFTAttention(nn.Module):
         position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None,
         **kwargs: Any,
     ) -> tuple[torch.Tensor, ...]:
-        """Inference forward: gate prediction + base attention (sparse path ready).
+        """Inference forward: gate-driven sparse or dense attention.
 
-        Runs the gate first to predict block importance, then runs base attention.
-        The gate output can be used by a sparse attention kernel to skip unimportant blocks.
+        Performs Q/K/V projections, runs the gate to predict block importance,
+        then dispatches to block-sparse kernel (when sparsity >= min_sparsity_for_speedup)
+        or dense SDPA fallback (when sparsity is too low for kernel speedup).
 
-        Stores self._last_gate_output for trainer extraction.
+        If the base attention module does not expose q_proj/k_proj/v_proj/o_proj
+        (non-standard architecture), falls back to the base module's forward directly.
+
+        Stores self._last_gate_output for downstream extraction.
+
+        Returns:
+            HF-compatible tuple (attn_output, None, past_key_value).
+
+        Complexity:
+            Sparse path: O(B * H * S^2 * (1-sparsity) * D / block_size^2)
+            Dense path:  O(B * H * S^2 * D)
+        """
+        attn = self.base_attn
+
+        # Guard: require q_proj, k_proj, v_proj, o_proj for direct sparse path.
+        # If missing, fall back to base_attn.forward() with no sparse acceleration.
+        if not all(
+            hasattr(attn, proj) for proj in ("q_proj", "k_proj", "v_proj", "o_proj")
+        ):
+            return self._dense_fallback_via_base(
+                hidden_states=hidden_states,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                past_key_value=past_key_value,
+                use_cache=use_cache,
+                cache_position=cache_position,
+                position_embeddings=position_embeddings,
+                **kwargs,
+            )
+
+        bsz, q_len, hidden_dim = hidden_states.shape
+
+        # Project Q/K/V, apply rotary embeddings, handle GQA and KV cache
+        query_states, key_states, value_states, head_dim = self._prepare_qkv(
+            attn, hidden_states, bsz, q_len,
+            position_ids, position_embeddings, past_key_value,
+        )
+        new_past_key_value = (key_states, value_states) if use_cache else None
+
+        # Run gate on Q, K to get hard block mask
+        gate_output = self.gate(query_states, key_states)
+        self._last_gate_output = gate_output
+        self._last_attn_weights = None
+
+        # Dispatch sparse vs dense based on achieved sparsity and kernel availability
+        kernel = self._get_kernel()
+        use_sparse = (
+            kernel is not None
+            and gate_output.sparsity_ratio >= self.min_sparsity_for_speedup
+        )
+
+        if use_sparse:
+            # Sparse path: block-sparse kernel skips masked-out blocks
+            attn_output = kernel.forward(
+                query_states,
+                key_states,
+                value_states,
+                gate_output.hard_mask,
+                causal=True,
+            )
+        else:
+            # Dense fallback: sparsity too low for kernel overhead to pay off
+            scale = 1.0 / (head_dim ** 0.5)
+            attn_weights = torch.matmul(
+                query_states, key_states.transpose(-2, -1),
+            ) * scale
+            if attention_mask is not None:
+                causal_mask = attention_mask
+                if causal_mask.ndim == 2:
+                    causal_mask = causal_mask[:, None, None, :]
+                attn_weights = attn_weights + causal_mask
+            attn_weights = F.softmax(attn_weights, dim=-1, dtype=torch.float32)
+            attn_weights = attn_weights.to(value_states.dtype)
+            attn_output = torch.matmul(attn_weights, value_states)
+
+        # Step 7: Reshape [B, H, S, D] -> [B, S, hidden_dim] and apply output projection
+        attn_output = attn_output.transpose(1, 2).contiguous().reshape(bsz, q_len, hidden_dim)
+        attn_output = attn.o_proj(attn_output)
+
+        return (attn_output, None, new_past_key_value)
+
+    def _prepare_qkv(
+        self,
+        attn: nn.Module,
+        hidden_states: torch.Tensor,
+        bsz: int,
+        q_len: int,
+        position_ids: torch.Tensor | None,
+        position_embeddings: tuple[torch.Tensor, torch.Tensor] | None,
+        past_key_value: Any | None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]:
+        """Project Q/K/V, apply rotary embeddings, expand GQA heads, and update KV cache.
+
+        Centralizes the projection pipeline shared by sparse and dense inference paths.
+
+        Args:
+            attn: Base attention module with q_proj, k_proj, v_proj attributes.
+            hidden_states: [B, S, hidden_dim] input tensor.
+            bsz: Batch size.
+            q_len: Sequence length.
+            position_ids: Position IDs for rotary embeddings (if rotary_emb on attn).
+            position_embeddings: Pre-computed (cos, sin) for rotary embeddings.
+            past_key_value: KV cache (DynamicCache or legacy tuple).
+
+        Returns:
+            (query_states, key_states, value_states, head_dim) all with GQA-expanded heads
+            and KV cache applied. Shapes: [B, num_heads, S_total, head_dim].
+
+        Complexity: O(B * S * H * D) for projections + O(B * H * S * D) for rotary.
+        """
+        query_states = attn.q_proj(hidden_states)
+        key_states = attn.k_proj(hidden_states)
+        value_states = attn.v_proj(hidden_states)
+
+        num_heads: int = getattr(attn, "num_heads", 0)
+        num_kv_heads: int = getattr(attn, "num_key_value_heads", num_heads)
+        head_dim: int = getattr(attn, "head_dim", 0)
+
+        # Reshape to [B, num_heads, S, head_dim]
+        query_states = query_states.view(bsz, q_len, num_heads, head_dim).transpose(1, 2)
+        key_states = key_states.view(bsz, q_len, num_kv_heads, head_dim).transpose(1, 2)
+        value_states = value_states.view(bsz, q_len, num_kv_heads, head_dim).transpose(1, 2)
+
+        # Apply rotary position embeddings if available
+        if position_embeddings is not None:
+            cos, sin = position_embeddings
+            query_states, key_states = _apply_rotary_pos_emb(
+                query_states, key_states, cos, sin,
+            )
+        elif hasattr(attn, "rotary_emb") and position_ids is not None:
+            cos, sin = attn.rotary_emb(value_states, position_ids)
+            query_states, key_states = _apply_rotary_pos_emb(
+                query_states, key_states, cos, sin,
+            )
+
+        # GQA head expansion: repeat KV heads to match Q heads
+        if num_kv_heads < num_heads:
+            n_rep = num_heads // num_kv_heads
+            key_states = key_states.repeat_interleave(n_rep, dim=1)
+            value_states = value_states.repeat_interleave(n_rep, dim=1)
+
+        # Handle KV cache for autoregressive generation
+        if past_key_value is not None:
+            if hasattr(past_key_value, "update"):
+                key_states, value_states = past_key_value.update(
+                    key_states, value_states, self.layer_idx,
+                )
+            else:
+                cache_k, cache_v = past_key_value
+                key_states = torch.cat([cache_k, key_states], dim=2)
+                value_states = torch.cat([cache_v, value_states], dim=2)
+
+        return query_states, key_states, value_states, head_dim
+
+    def _dense_fallback_via_base(
+        self,
+        hidden_states: torch.Tensor,
+        attention_mask: torch.Tensor | None = None,
+        position_ids: torch.Tensor | None = None,
+        past_key_value: Any | None = None,
+        use_cache: bool = False,
+        cache_position: torch.Tensor | None = None,
+        position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None,
+        **kwargs: Any,
+    ) -> tuple[torch.Tensor, ...]:
+        """Dense fallback via base_attn.forward() for architectures without standard projections.
+
+        Used when the base attention module does not expose q_proj/k_proj/v_proj/o_proj,
+        making direct sparse attention impossible. Runs the gate on extracted Q/K if possible
+        for observability, but attention itself is fully dense.
 
         Returns:
             HF-compatible tuple (attn_output, None, past_key_value).
         """
-        # Try to extract Q, K for gate prediction
-        gate_output: GateOutput | None = None
+        # Attempt gate prediction for observability even without sparse path
         q_proj, k_proj = self._extract_qk_projections(hidden_states)
         if q_proj is not None and k_proj is not None:
-            gate_output = self.gate(q_proj, k_proj)
-
-        # Store gate output for trainer extraction
-        self._last_gate_output = gate_output
+            self._last_gate_output = self.gate(q_proj, k_proj)
+        else:
+            self._last_gate_output = None
         self._last_attn_weights = None
 
-        # Run base attention (future: integrate sparse mask from gate_output)
         base_output = self.base_attn(
             hidden_states=hidden_states,
             attention_mask=attention_mask,
@@ -440,6 +656,45 @@ class TASFTAttention(nn.Module):
             f"compute_gate_target={self.compute_gate_target}, "
             f"gate_params={self.gate.num_parameters}"
         )
+
+
+def _apply_rotary_pos_emb(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Apply rotary position embeddings to Q and K tensors.
+
+    Handles both [B, S, D] and [B, 1, S, D] cos/sin shapes by normalizing
+    to 4D before element-wise multiply.
+
+    Args:
+        q: [B, H, S, D] query tensor.
+        k: [B, H, S, D] key tensor.
+        cos: Cosine component of rotary embeddings.
+        sin: Sine component of rotary embeddings.
+
+    Returns:
+        Tuple of (q_rotated, k_rotated) with same shapes as inputs.
+
+    Complexity: O(B * H * S * D).
+    """
+
+    def _rotate_half(x: torch.Tensor) -> torch.Tensor:
+        """Split last dim in half and rotate: [-x2, x1]."""
+        x1 = x[..., : x.shape[-1] // 2]
+        x2 = x[..., x.shape[-1] // 2 :]
+        return torch.cat((-x2, x1), dim=-1)
+
+    # Ensure cos/sin have head dimension: [B, S, D] -> [B, 1, S, D]
+    if cos.ndim == 3:
+        cos = cos.unsqueeze(1)
+        sin = sin.unsqueeze(1)
+
+    q_embed = (q * cos) + (_rotate_half(q) * sin)
+    k_embed = (k * cos) + (_rotate_half(k) * sin)
+    return q_embed, k_embed
 
 
 def patch_model_attention(
