@@ -104,7 +104,7 @@ model = AutoModelForCausalLM.from_pretrained("meta-llama/Meta-Llama-3-8B")
 
 # Inject TASFT (LoRA + AttnGate) into all attention layers
 gate_config = GateConfig(block_size=64, num_layers=32)
-patch_model_attention(model, gate_config)
+patched_layers = patch_model_attention(model, gate_config)
 
 # Configure co-training
 args = TASFTTrainingArguments(
@@ -123,7 +123,9 @@ args = TASFTTrainingArguments(
     bf16=True,
 )
 
-trainer = TASFTTrainer(model=model, args=args, train_dataset=your_dataset)
+trainer = TASFTTrainer(
+    model=model, args=args, patched_layers=patched_layers, train_dataset=your_dataset,
+)
 trainer.train()
 ```
 
@@ -199,13 +201,13 @@ memory = layers_active × B × H × S² × dtype_bytes
 
 | Config | layers_active | B | H | S | Memory |
 |--------|--------------|---|---|------|--------|
-| Naive (all layers) | 32 | 4 | 32 | 2048 | 33.6 GB |
+| Naive (all layers) | 32 | 4 | 32 | 2048 | 32.0 GB |
 | Layer rotation (4/32) | 4 | 4 | 32 | 2048 | 4.0 GB |
 | Layer rotation (4/32) | 4 | 8 | 32 | 2048 | 8.0 GB |
 
-**Layer-rotating calibration**: at each step, only `layers_per_step` layers (default 4) compute gate targets. All 32 layers are covered over `ceil(32/4) = 8` steps via round-robin scheduling. This reduces peak activation memory from 33.6 GB to 4.0 GB at batch_size=4, making single-H100 training feasible.
+**Layer-rotating calibration**: at each step, only `layers_per_step` layers (default 4) compute gate targets. All 32 layers are covered over `ceil(32/4) = 8` steps via round-robin scheduling. This reduces peak activation memory from 32.0 GB to 4.0 GB at batch_size=4, making single-H100 training feasible.
 
-At batch_size=1, the naive approach uses only 8.4 GB — but realistic training batch sizes of 4-8 make layer rotation necessary for single-GPU training.
+At batch_size=1, the naive approach uses only 8.0 GB — but realistic training batch sizes of 4-8 make layer rotation necessary for single-GPU training.
 
 ## Hardware Requirements
 
