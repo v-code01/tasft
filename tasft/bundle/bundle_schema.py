@@ -129,8 +129,8 @@ class BundleManifest(BaseModel):
     git_hash: str
     training_args_hash: str  # SHA256 of training args JSON
     checksums: dict[str, str]  # relative path from bundle root -> SHA256 hex digest
-    total_size_bytes: int
-    num_layers: int
+    total_size_bytes: Annotated[int, Field(ge=0)]
+    num_layers: Annotated[int, Field(ge=0)]
 
     @field_validator("checksums")
     @classmethod
@@ -154,12 +154,12 @@ class EvalSummary(BaseModel):
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
-    task_accuracy: float
-    task_accuracy_baseline: float
+    task_accuracy: Annotated[float, Field(ge=0.0, le=1.0)]
+    task_accuracy_baseline: Annotated[float, Field(ge=0.0, le=1.0)]
     delta_accuracy: float
     mean_tokens_per_second: float
-    speedup_vs_dense: float
-    mean_sparsity: float
+    speedup_vs_dense: Annotated[float, Field(gt=0.0)]
+    mean_sparsity: Annotated[float, Field(ge=0.0, le=1.0)]
     eval_domain: str
 
 

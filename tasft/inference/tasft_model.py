@@ -24,11 +24,13 @@ Postconditions:
 
 Complexity: O(L * S^2 / sparsity) per forward pass where L = layers, S = seq_len
 """
+
 from __future__ import annotations
 
 import hashlib
 import json
 import statistics
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -45,6 +47,7 @@ from tasft.exceptions import BundleError, ChecksumError, InferenceError
 from tasft.kernels.kernel_config import KernelConfig
 from tasft.modules.attn_gate import AttnGate, GateOutput
 from tasft.observability.logging import get_logger, timed_operation
+from tasft.observability.tracing import get_tracer, trace_inference_request
 from tasft.types import LayerIndex, SparsityProfile, SparsityRatio
 
 if TYPE_CHECKING:
@@ -247,12 +250,18 @@ class _SparseAttentionWrapper(nn.Module):
         if position_embeddings is not None:
             cos, sin = position_embeddings
             query_states, key_states = _apply_rotary_pos_emb(
-                query_states, key_states, cos, sin,
+                query_states,
+                key_states,
+                cos,
+                sin,
             )
         elif hasattr(attn, "rotary_emb") and position_ids is not None:
             cos, sin = attn.rotary_emb(value_states, position_ids)
             query_states, key_states = _apply_rotary_pos_emb(
-                query_states, key_states, cos, sin,
+                query_states,
+                key_states,
+                cos,
+                sin,
             )
 
         # Handle GQA: expand KV heads to match Q heads
@@ -266,7 +275,9 @@ class _SparseAttentionWrapper(nn.Module):
             if hasattr(past_key_value, "update"):
                 # HF DynamicCache interface
                 key_states, value_states = past_key_value.update(
-                    key_states, value_states, self.layer_idx,
+                    key_states,
+                    value_states,
+                    self.layer_idx,
                 )
             else:
                 # Legacy tuple cache
@@ -630,11 +641,27 @@ class TASFTInferenceModel(nn.Module):
 
         Complexity: O(L * B * H * S^2 * (1 - mean_sparsity) * D).
         """
-        return self.model(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            **kwargs,
-        )
+        seq_len = input_ids.shape[1] if input_ids.ndim > 1 else input_ids.shape[0]
+        request_id = uuid.uuid4().hex
+        with trace_inference_request(
+            request_id=request_id,
+            seq_len=seq_len,
+            batch_size=str(input_ids.shape[0]),
+            bundle_path=self.bundle_path,
+        ) as span:
+            output = self.model(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                **kwargs,
+            )
+            # Record per-layer sparsity on the span after forward completes
+            for wrapper in self._sparse_wrappers:
+                if wrapper.last_gate_output is not None:
+                    span.set_attribute(
+                        f"tasft.layer_{wrapper.layer_idx}_sparsity",
+                        wrapper.last_gate_output.sparsity_ratio,
+                    )
+            return output
 
     @torch.inference_mode()
     def benchmark_inference(
@@ -699,50 +726,73 @@ class TASFTInferenceModel(nn.Module):
             gpu=gpu_name,
         )
 
-        # Warmup: populate CUDA caches and JIT kernels
-        for _ in range(num_warmup):
-            self.forward(input_ids)
-
-        torch.cuda.synchronize(device)
-
-        # Timed iterations with CUDA events for precise measurement
-        latencies_ms: list[float] = []
-        for _ in range(num_timed):
-            start_event = torch.cuda.Event(enable_timing=True)
-            end_event = torch.cuda.Event(enable_timing=True)
-
-            start_event.record()
-            self.forward(input_ids)
-            end_event.record()
+        tracer = get_tracer()
+        with tracer.start_as_current_span(
+            "inference.benchmark",
+            attributes={
+                "tasft.batch_size": batch_size,
+                "tasft.seq_len": seq_len,
+                "tasft.num_warmup": num_warmup,
+                "tasft.num_timed": num_timed,
+                "tasft.gpu_name": gpu_name,
+                "tasft.bundle_path": self.bundle_path,
+            },
+        ) as benchmark_span:
+            # Warmup: populate CUDA caches and JIT kernels
+            for _ in range(num_warmup):
+                self.forward(input_ids)
 
             torch.cuda.synchronize(device)
-            latencies_ms.append(start_event.elapsed_time(end_event))
 
-        # Collect sparsity from last forward pass
-        sparsity_profile = self.get_sparsity_profile(input_ids)
+            # Timed iterations with CUDA events for precise measurement
+            latencies_ms: list[float] = []
+            for _ in range(num_timed):
+                start_event = torch.cuda.Event(enable_timing=True)
+                end_event = torch.cuda.Event(enable_timing=True)
 
-        # Compute statistics
-        sorted_latencies = sorted(latencies_ms)
-        mean_latency = statistics.mean(latencies_ms)
+                start_event.record()
+                self.forward(input_ids)
+                end_event.record()
 
-        p50_idx = int(len(sorted_latencies) * 0.50)
-        p95_idx = min(int(len(sorted_latencies) * 0.95), len(sorted_latencies) - 1)
-        p99_idx = min(int(len(sorted_latencies) * 0.99), len(sorted_latencies) - 1)
+                torch.cuda.synchronize(device)
+                latencies_ms.append(start_event.elapsed_time(end_event))
 
-        result = InferenceBenchmark(
-            tokens_per_second=total_tokens / (mean_latency / 1000.0),
-            mean_latency_ms=mean_latency,
-            p50_ms=sorted_latencies[p50_idx],
-            p95_ms=sorted_latencies[p95_idx],
-            p99_ms=sorted_latencies[p99_idx],
-            mean_sparsity_per_layer={
-                LayerIndex(k): v for k, v in sparsity_profile.items()
-            },
-            gpu_name=gpu_name,
-            bundle_path=self.bundle_path,
-            num_warmup=num_warmup,
-            num_timed=num_timed,
-        )
+            # Collect sparsity from last forward pass
+            sparsity_profile = self.get_sparsity_profile(input_ids)
+
+            # Compute statistics
+            sorted_latencies = sorted(latencies_ms)
+            mean_latency = statistics.mean(latencies_ms)
+
+            p50_idx = int(len(sorted_latencies) * 0.50)
+            p95_idx = min(int(len(sorted_latencies) * 0.95), len(sorted_latencies) - 1)
+            p99_idx = min(int(len(sorted_latencies) * 0.99), len(sorted_latencies) - 1)
+
+            result = InferenceBenchmark(
+                tokens_per_second=total_tokens / (mean_latency / 1000.0),
+                mean_latency_ms=mean_latency,
+                p50_ms=sorted_latencies[p50_idx],
+                p95_ms=sorted_latencies[p95_idx],
+                p99_ms=sorted_latencies[p99_idx],
+                mean_sparsity_per_layer={LayerIndex(k): v for k, v in sparsity_profile.items()},
+                gpu_name=gpu_name,
+                bundle_path=self.bundle_path,
+                num_warmup=num_warmup,
+                num_timed=num_timed,
+            )
+
+            # Record benchmark results on the span
+            benchmark_span.set_attribute(
+                "tasft.tokens_per_second",
+                result.tokens_per_second,
+            )
+            benchmark_span.set_attribute(
+                "tasft.mean_latency_ms",
+                result.mean_latency_ms,
+            )
+            benchmark_span.set_attribute("tasft.p50_ms", result.p50_ms)
+            benchmark_span.set_attribute("tasft.p95_ms", result.p95_ms)
+            benchmark_span.set_attribute("tasft.p99_ms", result.p99_ms)
 
         logger.info(
             "[BENCHMARK_COMPLETE] Inference benchmark finished",

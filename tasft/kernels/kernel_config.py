@@ -19,9 +19,11 @@ Complexity: O(n) validation where n = number of layers configured.
 
 from __future__ import annotations
 
-from pydantic import BaseModel, ConfigDict, field_validator
+from pydantic import BaseModel, ConfigDict, field_validator, model_validator
 
-_VALID_BLOCK_SIZES = frozenset({32, 64, 128})
+from tasft.types import VALID_BLOCK_SIZES
+
+_VALID_BLOCK_SIZES = VALID_BLOCK_SIZES  # Local alias for backward compat
 
 
 class LayerKernelConfig(BaseModel):
@@ -37,7 +39,7 @@ class LayerKernelConfig(BaseModel):
         block_size: Attention block granularity in tokens. Must be 32, 64, or 128.
     """
 
-    model_config = ConfigDict(frozen=True)
+    model_config = ConfigDict(frozen=True, extra="forbid")
 
     layer_idx: int
     threshold_tau: float
@@ -81,7 +83,7 @@ class KernelConfig(BaseModel):
             is used instead of sparse kernel (sparse overhead exceeds savings).
     """
 
-    model_config = ConfigDict(frozen=True)
+    model_config = ConfigDict(frozen=True, extra="forbid")
 
     block_size: int = 64
     global_threshold: float = 0.5
@@ -111,6 +113,31 @@ class KernelConfig(BaseModel):
             msg = f"min_sparsity_for_speedup must be in [0, 1], got {v}"
             raise ValueError(msg)
         return v
+
+    @model_validator(mode="after")
+    def _validate_layer_consistency(self) -> KernelConfig:
+        """Ensure each per-layer config key matches its layer_idx and block_size matches global.
+
+        Invariant: per_layer_config dict keys are the canonical layer index source.
+        Each LayerKernelConfig.layer_idx must equal its dict key, and each layer's
+        block_size must equal the global block_size to prevent silent misconfiguration.
+
+        Complexity: O(n) where n = len(per_layer_config).
+        """
+        for layer_idx, cfg in self.per_layer_config.items():
+            if cfg.layer_idx != layer_idx:
+                msg = (
+                    f"Layer config key {layer_idx} doesn't match "
+                    f"cfg.layer_idx {cfg.layer_idx}"
+                )
+                raise ValueError(msg)
+            if cfg.block_size != self.block_size:
+                msg = (
+                    f"Layer {layer_idx} block_size {cfg.block_size} "
+                    f"!= global {self.block_size}"
+                )
+                raise ValueError(msg)
+        return self
 
     def get_layer_threshold(self, layer_idx: int) -> float:
         """Return threshold for a specific layer, falling back to global default.

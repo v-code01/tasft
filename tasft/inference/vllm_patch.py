@@ -38,7 +38,7 @@ if TYPE_CHECKING:
 logger = get_logger("tasft.inference.vllm_patch")
 
 _patch_lock = threading.Lock()
-_patch_applied = False
+_patched_workers: set[int] = set()
 
 
 class TASFTvLLMAttentionBackend(nn.Module):
@@ -83,6 +83,16 @@ class TASFTvLLMAttentionBackend(nn.Module):
             head_dim: Dimension per head.
         """
         super().__init__()
+
+        # Validate GQA head divisibility — silent truncation from integer
+        # division would produce incorrect attention patterns
+        if num_heads % num_kv_heads != 0:
+            msg = f"num_heads ({num_heads}) must be divisible by num_kv_heads ({num_kv_heads})"
+            raise InferenceError(
+                msg,
+                context={"num_heads": num_heads, "num_kv_heads": num_kv_heads},
+            )
+
         self.gate = gate
         self.layer_idx = layer_idx
         self.threshold_tau = threshold_tau
@@ -320,7 +330,7 @@ def _extract_vllm_attention_modules(worker_model: nn.Module) -> list[nn.Module]:
     for _name, module in worker_model.named_modules():
         cls_name = type(module).__name__
         # vLLM wraps attention in various classes
-        if "Attention" in cls_name and (
+        if cls_name.endswith("Attention") and (
             hasattr(module, "qkv_proj") or hasattr(module, "q_proj")
         ):
             attn_modules.append(module)
@@ -372,14 +382,19 @@ def patch_vllm_attention(
 
     Complexity: O(L) where L = number of attention layers.
     """
-    global _patch_applied  # noqa: PLW0603
-
     with _patch_lock:
-        if _patch_applied:
-            logger.info("[VLLM_PATCH] Patch already applied, skipping")
+        worker_id = id(vllm_worker)
+        if worker_id in _patched_workers:
+            logger.info(
+                "[VLLM_PATCH] Patch already applied to this worker, skipping",
+                worker_id=worker_id,
+            )
             return
 
-        logger.info("[VLLM_PATCH] Applying TASFT sparse attention patch to vLLM")
+        logger.info(
+            "[VLLM_PATCH] Applying TASFT sparse attention patch to vLLM",
+            worker_id=worker_id,
+        )
 
         # Get the model from the worker
         if hasattr(vllm_worker, "model_runner"):
@@ -495,9 +510,10 @@ def patch_vllm_attention(
                 num_kv_heads=num_kv_heads,
             )
 
-        _patch_applied = True
+        _patched_workers.add(worker_id)
         logger.info(
             "[VLLM_PATCH] TASFT patch applied successfully",
+            worker_id=worker_id,
             num_layers_patched=num_vllm_layers,
         )
 
@@ -515,11 +531,13 @@ def unpatch_vllm_attention(vllm_worker: Any) -> None:
 
     Complexity: O(L) where L = number of attention layers.
     """
-    global _patch_applied  # noqa: PLW0603
-
     with _patch_lock:
-        if not _patch_applied:
-            logger.info("[VLLM_UNPATCH] No patch applied, skipping")
+        worker_id = id(vllm_worker)
+        if worker_id not in _patched_workers:
+            logger.info(
+                "[VLLM_UNPATCH] No patch applied to this worker, skipping",
+                worker_id=worker_id,
+            )
             return
 
         if hasattr(vllm_worker, "model_runner"):
@@ -529,7 +547,7 @@ def unpatch_vllm_attention(vllm_worker: Any) -> None:
         else:
             # Unrecognized worker type — still reset patch state so
             # a subsequent patch_vllm_attention call can re-apply
-            _patch_applied = False
+            _patched_workers.discard(worker_id)
             logger.warning(
                 "[VLLM_UNPATCH] Unrecognized worker type, reset patch state only",
                 worker_type=type(vllm_worker).__name__,
@@ -543,23 +561,23 @@ def unpatch_vllm_attention(vllm_worker: Any) -> None:
                 if hasattr(module, "_tasft_backend"):
                     del module._tasft_backend  # type: ignore[attr-defined]
 
-        _patch_applied = False
-        logger.info("[VLLM_UNPATCH] TASFT patch removed successfully")
+        _patched_workers.discard(worker_id)
+        logger.info("[VLLM_UNPATCH] TASFT patch removed successfully", worker_id=worker_id)
 
 
 def is_patched() -> bool:
-    """Check if TASFT vLLM patch is currently applied.
+    """Check if TASFT vLLM patch is currently applied to any worker.
 
     Thread-safe read of patch state. Acquires _patch_lock to ensure
     visibility across threads (safe for GIL-free Python per PEP 703).
 
     Returns:
-        True if patch_vllm_attention has been called and not unpatched.
+        True if at least one worker has been patched and not unpatched.
 
     Complexity: O(1).
     """
     with _patch_lock:
-        return _patch_applied
+        return len(_patched_workers) > 0
 
 
 __all__ = [

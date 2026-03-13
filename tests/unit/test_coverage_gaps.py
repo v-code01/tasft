@@ -55,7 +55,7 @@ class TestVLLMPatchIsPatched:
         import tasft.inference.vllm_patch as vp
 
         with vp._patch_lock:
-            vp._patch_applied = False
+            vp._patched_workers.clear()
 
     def test_is_patched_initially_false(self) -> None:
         """is_patched() returns False before any patching."""
@@ -64,11 +64,11 @@ class TestVLLMPatchIsPatched:
         assert is_patched() is False
 
     def test_is_patched_after_manual_set(self) -> None:
-        """is_patched() reflects the module-level _patch_applied state."""
+        """is_patched() reflects the module-level _patched_workers state."""
         import tasft.inference.vllm_patch as vp
 
         with vp._patch_lock:
-            vp._patch_applied = True
+            vp._patched_workers.add(0xDEAD)
         assert vp.is_patched() is True
 
     def test_unpatch_when_not_patched_is_noop(self) -> None:
@@ -211,18 +211,19 @@ class TestPatchVLLMAttentionErrors:
         import tasft.inference.vllm_patch as vp
 
         with vp._patch_lock:
-            vp._patch_applied = False
+            vp._patched_workers.clear()
 
     def test_patch_already_applied_is_noop(self) -> None:
         """Calling patch when already applied logs and returns."""
         import tasft.inference.vllm_patch as vp
 
-        with vp._patch_lock:
-            vp._patch_applied = True
-
         mock_model = MagicMock()
         mock_worker = MagicMock()
-        # Should not raise
+
+        with vp._patch_lock:
+            vp._patched_workers.add(id(mock_worker))
+
+        # Should not raise — worker already in patched set
         vp.patch_vllm_attention(mock_model, mock_worker)
         assert vp.is_patched() is True
 
