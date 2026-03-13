@@ -44,7 +44,6 @@ from tasft.modules.attn_gate import AttnGate
 from tasft.modules.tasft_attention import (
     GateConfig,
     TASFTAttention,
-    TASFTAttentionOutput,
     patch_model_attention,
 )
 from tasft.observability import bind_context, get_logger
@@ -224,16 +223,15 @@ class TASFTPlugin:
                 continue
 
             # Access cached outputs from the forward pass
-            # TASFTAttention stores these during forward when compute_gate_target=True
-            last_output = getattr(tasft_attn, "_last_output", None)
-            if last_output is None:
-                continue
+            # TASFTAttention stores these as instance attributes during forward
+            last_gate = getattr(tasft_attn, "_last_gate_output", None)
+            last_attn = getattr(tasft_attn, "_last_attn_weights", None)
 
-            if last_output.gate_output is not None:
-                gate_outputs_by_layer[layer_idx] = last_output.gate_output.soft_scores
+            if last_gate is not None:
+                gate_outputs_by_layer[layer_idx] = last_gate.soft_scores
 
-            if last_output.attn_weights is not None:
-                attn_scores_by_layer[layer_idx] = last_output.attn_weights
+            if last_attn is not None:
+                attn_scores_by_layer[layer_idx] = last_attn
 
         # Compute dual objective
         block_size = self._gate_config.block_size if self._gate_config is not None else 64
@@ -270,11 +268,11 @@ class TASFTPlugin:
             if tasft_attn is None:
                 continue
 
-            last_output = getattr(tasft_attn, "_last_output", None)
-            if last_output is not None and last_output.gate_output is not None:
+            last_gate = getattr(tasft_attn, "_last_gate_output", None)
+            if last_gate is not None:
                 self._metrics.record_sparsity(
                     layer=layer_idx,
-                    ratio=float(last_output.gate_output.sparsity_ratio),
+                    ratio=float(last_gate.sparsity_ratio),
                 )
 
         # Log periodically

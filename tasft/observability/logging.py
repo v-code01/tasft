@@ -12,13 +12,16 @@ import os
 import subprocess
 import sys
 import time
-from collections.abc import Generator
 from contextlib import contextmanager
 from importlib.metadata import version
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import structlog
-from structlog.types import BindableLogger
+
+if TYPE_CHECKING:
+    from collections.abc import Generator
+
+    from structlog.types import BindableLogger
 
 
 def _get_git_hash() -> str:
@@ -29,7 +32,7 @@ def _get_git_hash() -> str:
     Complexity: O(1) — single subprocess call, cached at module load.
     """
     try:
-        result = subprocess.run(  # noqa: S603, S607
+        result = subprocess.run(
             ["git", "rev-parse", "--short", "HEAD"],
             capture_output=True,
             text=True,
@@ -143,7 +146,7 @@ def bind_context(
         ctx["layer_idx"] = layer_idx
     ctx.update(extra)
 
-    token = structlog.contextvars.bind_contextvars(**ctx)
+    structlog.contextvars.bind_contextvars(**ctx)
     try:
         yield
     finally:

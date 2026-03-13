@@ -27,7 +27,7 @@ Complexity: O(n_batches * L * B * H * (S/block_size)^2) per evaluation
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Final
 
 import numpy as np
@@ -36,10 +36,9 @@ import torch.nn.functional as F
 from scipy import stats
 
 from tasft.exceptions import TASFTError, ValidationError
-from tasft.modules.attn_gate import AttnGate, GateOutput
-from tasft.training.objectives import TASFTObjective
-from tasft.types import LayerIndex, SparsityRatio
+from tasft.modules.attn_gate import AttnGate
 from tasft.observability.logging import get_logger, timed_operation
+from tasft.training.objectives import TASFTObjective
 
 logger = get_logger("tasft.eval.gate_quality")
 
@@ -74,13 +73,15 @@ class GateQualityResult:
 
     def __post_init__(self) -> None:
         if self.model_type not in ("cotrained", "posthoc"):
+            msg = f"model_type must be 'cotrained' or 'posthoc', got '{self.model_type}'"
             raise ValidationError(
-                f"model_type must be 'cotrained' or 'posthoc', got '{self.model_type}'",
+                msg,
                 context={"model_type": self.model_type},
             )
         if self.n_samples <= 0:
+            msg = f"n_samples must be positive, got {self.n_samples}"
             raise ValidationError(
-                f"n_samples must be positive, got {self.n_samples}",
+                msg,
                 context={"n_samples": self.n_samples},
             )
 
@@ -152,8 +153,9 @@ class GateQualityEvaluator:
             block_size: Block size for ground-truth computation. Must match gate block_size.
         """
         if block_size <= 0:
+            msg = f"block_size must be positive, got {block_size}"
             raise ValidationError(
-                f"block_size must be positive, got {block_size}",
+                msg,
                 context={"block_size": block_size},
             )
         self._block_size = block_size
@@ -187,10 +189,12 @@ class GateQualityEvaluator:
             GateEvalError: If bundle loading or evaluation fails.
         """
         try:
-            from transformers import AutoModelForCausalLM
+            import transformers
+            del transformers
         except ImportError as exc:
+            msg = "transformers required for gate evaluation"
             raise GateEvalError(
-                "transformers required for gate evaluation",
+                msg,
                 context={"missing_package": "transformers"},
             ) from exc
 
@@ -234,19 +238,40 @@ class GateQualityEvaluator:
                 # Get gate predictions — need Q, K from model internals
                 # For evaluation, derive Q/K from attention scores via the gate's own forward
                 # Use a synthetic approach: extract hidden states and project
-                hidden = outputs.hidden_states[layer_idx] if hasattr(outputs, "hidden_states") and outputs.hidden_states else None
+                has_hidden = (
+                    hasattr(outputs, "hidden_states")
+                    and outputs.hidden_states
+                )
+                hidden = (
+                    outputs.hidden_states[layer_idx]
+                    if has_hidden
+                    else None
+                )
 
-                if hidden is not None and hasattr(model, "model") and hasattr(model.model, "layers"):
+                has_layers = (
+                    hidden is not None
+                    and hasattr(model, "model")
+                    and hasattr(model.model, "layers")
+                )
+                if has_layers:
                     layer_module = model.model.layers[layer_idx]
                     if hasattr(layer_module, "self_attn"):
                         attn_module = layer_module.self_attn
                         B, S, D = hidden.shape
-                        num_heads = attn_module.num_heads if hasattr(attn_module, "num_heads") else gate.num_heads
+                        num_heads = (
+                            attn_module.num_heads
+                            if hasattr(attn_module, "num_heads")
+                            else gate.num_heads
+                        )
                         head_dim = D // num_heads
 
                         # Project to Q, K
-                        q = attn_module.q_proj(hidden).view(B, S, num_heads, head_dim).transpose(1, 2)
-                        k = attn_module.k_proj(hidden).view(B, S, num_heads, head_dim).transpose(1, 2)
+                        q = attn_module.q_proj(hidden).view(
+                            B, S, num_heads, head_dim,
+                        ).transpose(1, 2)
+                        k = attn_module.k_proj(hidden).view(
+                            B, S, num_heads, head_dim,
+                        ).transpose(1, 2)
 
                         gate_out = gate(q, k)
                         kl = _kl_divergence_block(gate_out.soft_scores, gate_target)
@@ -328,8 +353,9 @@ class GateQualityEvaluator:
         try:
             from transformers import AutoModelForCausalLM
         except ImportError as exc:
+            msg = "transformers required for gate evaluation"
             raise GateEvalError(
-                "transformers required for gate evaluation",
+                msg,
                 context={"missing_package": "transformers"},
             ) from exc
 
@@ -383,18 +409,43 @@ class GateQualityEvaluator:
                 )
 
                 # Gate predictions from BASE model's gates (the mismatch)
-                hidden = outputs.hidden_states[layer_idx] if hasattr(outputs, "hidden_states") and outputs.hidden_states else None
+                has_hidden = (
+                    hasattr(outputs, "hidden_states")
+                    and outputs.hidden_states
+                )
+                hidden = (
+                    outputs.hidden_states[layer_idx]
+                    if has_hidden
+                    else None
+                )
 
-                if hidden is not None and hasattr(finetuned_model, "model") and hasattr(finetuned_model.model, "layers"):
-                    layer_module = finetuned_model.model.layers[layer_idx]
+                has_layers = (
+                    hidden is not None
+                    and hasattr(finetuned_model, "model")
+                    and hasattr(
+                        finetuned_model.model, "layers",
+                    )
+                )
+                if has_layers:
+                    layer_module = (
+                        finetuned_model.model.layers[layer_idx]
+                    )
                     if hasattr(layer_module, "self_attn"):
                         attn_module = layer_module.self_attn
                         B, S, D = hidden.shape
-                        num_heads = attn_module.num_heads if hasattr(attn_module, "num_heads") else gate.num_heads
+                        num_heads = (
+                            attn_module.num_heads
+                            if hasattr(attn_module, "num_heads")
+                            else gate.num_heads
+                        )
                         head_dim = D // num_heads
 
-                        q = attn_module.q_proj(hidden).view(B, S, num_heads, head_dim).transpose(1, 2)
-                        k = attn_module.k_proj(hidden).view(B, S, num_heads, head_dim).transpose(1, 2)
+                        q = attn_module.q_proj(hidden).view(
+                            B, S, num_heads, head_dim,
+                        ).transpose(1, 2)
+                        k = attn_module.k_proj(hidden).view(
+                            B, S, num_heads, head_dim,
+                        ).transpose(1, 2)
 
                         gate_out = gate(q, k)
                         kl = _kl_divergence_block(gate_out.soft_scores, gate_target)
@@ -465,11 +516,16 @@ class GateQualityEvaluator:
             ValidationError: If the two results have mismatched layer sets.
         """
         # Identify common layers
-        common_layers = sorted(set(cotrained.per_layer_kl.keys()) & set(posthoc.per_layer_kl.keys()))
+        cotrained_keys = set(cotrained.per_layer_kl.keys())
+        posthoc_keys = set(posthoc.per_layer_kl.keys())
+        common_layers = sorted(
+            cotrained_keys & posthoc_keys,
+        )
 
         if len(common_layers) < 2:
+            msg = f"Need at least 2 common layers for paired t-test, got {len(common_layers)}"
             raise ValidationError(
-                f"Need at least 2 common layers for paired t-test, got {len(common_layers)}",
+                msg,
                 context={
                     "cotrained_layers": list(cotrained.per_layer_kl.keys()),
                     "posthoc_layers": list(posthoc.per_layer_kl.keys()),
@@ -484,7 +540,7 @@ class GateQualityEvaluator:
         )
 
         # Paired t-test: H0: mean(posthoc_kl - cotrained_kl) = 0
-        t_stat, p_value = stats.ttest_rel(posthoc_kls, cotrained_kls)
+        _t_stat, p_value = stats.ttest_rel(posthoc_kls, cotrained_kls)
 
         # Per-layer improvement: positive means cotrained is better
         per_layer_improvement = {
@@ -519,7 +575,7 @@ class GateQualityEvaluator:
         return result
 
     def _load_bundle(
-        self, bundle_path: str
+        self, bundle_path: str,
     ) -> tuple[torch.nn.Module, dict[int, AttnGate]]:
         """Load model and gates from a TASFT bundle or model path.
 
@@ -595,8 +651,9 @@ class GateQualityEvaluator:
             return model, gates
 
         except Exception as exc:
+            msg = f"Failed to load bundle from {bundle_path}: {exc}"
             raise GateEvalError(
-                f"Failed to load bundle from {bundle_path}: {exc}",
+                msg,
                 context={"bundle_path": bundle_path, "error": str(exc)},
             ) from exc
 
@@ -619,7 +676,7 @@ class GateQualityEvaluator:
 
         Complexity: O(B * H * S^2).
         """
-        b, h, s_q, s_k = attn_scores.shape
+        _b, _h, s_q, s_k = attn_scores.shape
         pad_q = (block_size - s_q % block_size) % block_size
         pad_k = (block_size - s_k % block_size) % block_size
         if pad_q > 0 or pad_k > 0:

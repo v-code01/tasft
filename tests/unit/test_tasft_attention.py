@@ -3,30 +3,31 @@
 Tests verify:
     - Patching replaces all attention layers with TASFTAttention
     - Base model weights are frozen after patching
-    - Training mode returns auxiliary gate outputs
-    - Inference mode returns only hidden states
+    - Training mode stores auxiliary gate outputs as instance attributes
+    - Inference mode returns only hidden states (tuple format)
     - Output shape is preserved after patching
     - Active gate layer selection works correctly
     - Dense-path output is close to original attention output
 
-All tests use a tiny GPT-2 LM model (2 layers, 4 heads, 32 head_dim = 128 hidden).
-GPT2LMHeadModel is used (not GPT2Model) because patch_model_attention expects
-model.transformer.h path, which GPT2LMHeadModel provides.
+Uses GPT2LMHeadModel for patching/freeze tests (provides model.transformer.h path).
+Uses a mock base attention module for forward pass tests. TASFTAttention returns
+HF-compatible tuple (attn_output, attn_weights, past_kv) and stores gate data as
+instance attributes (_last_gate_output, _last_attn_weights).
 """
 from __future__ import annotations
 
 import pytest
 import torch
+from torch import nn
 from transformers import GPT2Config, GPT2LMHeadModel
 
 from tasft.modules.attn_gate import AttnGate
 from tasft.modules.tasft_attention import (
     GateConfig,
     TASFTAttention,
-    TASFTAttentionOutput,
     patch_model_attention,
 )
-
+from tasft.types import LayerIndex
 
 _TINY_GPT2_CONFIG = GPT2Config(
     n_layer=2,
@@ -37,18 +38,63 @@ _TINY_GPT2_CONFIG = GPT2Config(
 )
 
 
-@pytest.fixture
-def tiny_model() -> GPT2LMHeadModel:
-    """Create a tiny GPT-2 LM model for testing: 2 layers, 4 heads, 128 hidden.
-
-    All base parameters are frozen to simulate real TASFT usage where the base model
-    is frozen before patching (LoRA would be applied separately for task adapters).
-    """
+def _make_frozen_model() -> GPT2LMHeadModel:
+    """Create a tiny GPT-2 model with all params frozen (simulates real TASFT pipeline)."""
     model = GPT2LMHeadModel(_TINY_GPT2_CONFIG)
-    # Freeze all base params (mimics real pipeline: freeze base -> apply LoRA -> patch)
     for param in model.parameters():
         param.requires_grad = False
     return model
+
+
+class _MockBaseAttn(nn.Module):
+    """Mock base attention with q_proj/k_proj for gate QK extraction testing.
+
+    Forward returns (attn_output, attn_weights) or (attn_output,) depending on
+    output_attentions flag, matching the HF convention.
+    """
+
+    def __init__(self, num_heads: int = 4, head_dim: int = 32) -> None:
+        super().__init__()
+        hidden_dim = num_heads * head_dim
+        self.q_proj = nn.Linear(hidden_dim, hidden_dim, bias=False)
+        self.k_proj = nn.Linear(hidden_dim, hidden_dim, bias=False)
+        self.v_proj = nn.Linear(hidden_dim, hidden_dim, bias=False)
+        self.o_proj = nn.Linear(hidden_dim, hidden_dim, bias=False)
+        self.num_heads = num_heads
+        self.head_dim = head_dim
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        attention_mask: torch.Tensor | None = None,
+        position_ids: torch.Tensor | None = None,
+        past_key_value: object = None,
+        output_attentions: bool = False,
+        use_cache: bool = False,
+        cache_position: torch.Tensor | None = None,
+        position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None,
+        **kwargs: object,
+    ) -> tuple[torch.Tensor, ...]:
+        B, S, _ = hidden_states.shape
+        nh, hd = self.num_heads, self.head_dim
+        q = self.q_proj(hidden_states).view(B, S, nh, hd).transpose(1, 2)
+        k = self.k_proj(hidden_states).view(B, S, nh, hd).transpose(1, 2)
+        v = self.v_proj(hidden_states).view(B, S, nh, hd).transpose(1, 2)
+        scale = hd ** -0.5
+        attn_weights = torch.matmul(q, k.transpose(-2, -1)) * scale
+        attn_probs = torch.softmax(attn_weights, dim=-1)
+        attn_output = torch.matmul(attn_probs, v)
+        attn_output = attn_output.transpose(1, 2).contiguous().view(B, S, nh * hd)
+        attn_output = self.o_proj(attn_output)
+        if output_attentions:
+            return (attn_output, attn_weights)
+        return (attn_output,)
+
+
+@pytest.fixture
+def tiny_model() -> GPT2LMHeadModel:
+    """Frozen tiny GPT-2 LM model for patching tests."""
+    return _make_frozen_model()
 
 
 @pytest.fixture
@@ -67,7 +113,7 @@ class TestPatchModelAttention:
     """Tests for patch_model_attention() and TASFTAttention integration."""
 
     def test_patch_replaces_all_attention_layers(
-        self, tiny_model: GPT2LMHeadModel, tiny_gate_config: GateConfig
+        self, tiny_model: GPT2LMHeadModel, tiny_gate_config: GateConfig,
     ) -> None:
         """After patching, every attention layer must be a TASFTAttention instance."""
         patched = patch_model_attention(tiny_model, tiny_gate_config)
@@ -85,23 +131,17 @@ class TestPatchModelAttention:
             )
 
     def test_base_weights_frozen_after_patch(
-        self, tiny_model: GPT2LMHeadModel, tiny_gate_config: GateConfig
+        self, tiny_model: GPT2LMHeadModel, tiny_gate_config: GateConfig,
     ) -> None:
-        """All non-gate parameters must have requires_grad=False after patching."""
-        original_trainable = sum(
-            p.numel() for p in tiny_model.parameters() if p.requires_grad
-        )
-        assert original_trainable > 0, "Model should have trainable params before patching"
-
+        """All non-gate parameters must have requires_grad=False after patching.
+        Only gate parameters should be trainable."""
         patched = patch_model_attention(tiny_model, tiny_gate_config)
 
-        # Collect gate parameter IDs
         gate_param_ids: set[int] = set()
         for tasft_attn in patched.values():
             for p in tasft_attn.gate.parameters():
                 gate_param_ids.add(id(p))
 
-        # All non-gate params must be frozen
         unfrozen_non_gate = [
             name
             for name, p in tiny_model.named_parameters()
@@ -112,7 +152,6 @@ class TestPatchModelAttention:
             f"{unfrozen_non_gate[:5]}"
         )
 
-        # Gate params must be trainable
         gate_trainable = sum(
             1 for tasft_attn in patched.values()
             for p in tasft_attn.gate.parameters()
@@ -120,91 +159,97 @@ class TestPatchModelAttention:
         )
         assert gate_trainable > 0, "Gate parameters should be trainable after patching"
 
-    def test_training_mode_returns_aux(
-        self, tiny_model: GPT2LMHeadModel, tiny_gate_config: GateConfig
-    ) -> None:
-        """With compute_gate_target=True and grad enabled, forward runs training path."""
-        patched = patch_model_attention(tiny_model, tiny_gate_config)
+    def test_training_mode_returns_aux(self) -> None:
+        """With compute_gate_target=True and grad enabled, forward returns
+        non-None gate_output and gate_target_scores."""
+        num_heads, head_dim = 4, 32
+        base_attn = _MockBaseAttn(num_heads, head_dim)
+        gate = AttnGate(
+            num_heads=num_heads, head_dim=head_dim,
+            block_size=8, gate_hidden_dim=16, default_threshold=0.5,
+        )
+        tasft_attn = TASFTAttention(
+            base_attn=base_attn, gate=gate,
+            layer_idx=LayerIndex(0), compute_gate_target=True,
+        )
+        tasft_attn.train()
 
-        # Enable training mode on all layers
-        for tasft_attn in patched.values():
-            tasft_attn.set_training_mode(True)
-
-        tiny_model.train()
-        input_ids = torch.randint(0, 512, (1, 32))
-        labels = input_ids.clone()
-
+        hidden = torch.randn(1, 32, num_heads * head_dim, requires_grad=True)
         with torch.enable_grad():
-            outputs = tiny_model(input_ids, labels=labels, output_attentions=True)
+            output = tasft_attn(hidden)
 
-        # Verify the model produced valid output (loss + logits)
-        assert outputs.loss is not None, "Expected loss in training output"
-        assert outputs.logits is not None, "Expected logits in training output"
+        # TASFTAttention returns HF-compatible tuple: (attn_output, attn_weights, past_kv)
+        assert isinstance(output, tuple), (
+            f"Expected tuple, got {type(output).__name__}"
+        )
+        assert output[0] is not None, "attn_output must not be None"
+        # Gate data stored as instance attributes for trainer extraction
+        assert tasft_attn._last_gate_output is not None, (
+            "gate_output must not be None in training mode"
+        )
+        assert tasft_attn.layer_idx == LayerIndex(0)
 
-        # Verify at least one layer was set to training mode
-        training_layers = [
-            idx for idx, t in patched.items() if t.compute_gate_target
-        ]
-        assert len(training_layers) > 0, "No layers had compute_gate_target=True"
+    def test_inference_mode_no_aux(self) -> None:
+        """With compute_gate_target=False and torch.no_grad(), forward returns
+        only hidden_states (gate_target_scores is None)."""
+        num_heads, head_dim = 4, 32
+        base_attn = _MockBaseAttn(num_heads, head_dim)
+        gate = AttnGate(
+            num_heads=num_heads, head_dim=head_dim,
+            block_size=8, gate_hidden_dim=16, default_threshold=0.5,
+        )
+        tasft_attn = TASFTAttention(
+            base_attn=base_attn, gate=gate,
+            layer_idx=LayerIndex(0), compute_gate_target=False,
+        )
+        tasft_attn.eval()
 
-    def test_inference_mode_no_aux(
-        self, tiny_model: GPT2LMHeadModel, tiny_gate_config: GateConfig
-    ) -> None:
-        """With compute_gate_target=False and no_grad, forward returns hidden_states only."""
-        patched = patch_model_attention(tiny_model, tiny_gate_config)
-
-        # Ensure inference mode on all layers
-        for tasft_attn in patched.values():
-            tasft_attn.set_training_mode(False)
-
-        tiny_model.eval()
-        input_ids = torch.randint(0, 512, (1, 32))
-
+        hidden = torch.randn(1, 32, num_heads * head_dim)
         with torch.no_grad():
-            outputs = tiny_model(input_ids, output_attentions=False)
+            output = tasft_attn(hidden)
 
-        # Verify model produces valid hidden states
-        # GPT2LMHeadModel returns CausalLMOutputWithCrossAttentions
-        assert outputs.logits is not None, "Expected logits in output"
-        assert outputs.logits.shape == (1, 32, 512), (
-            f"Unexpected logits shape: {outputs.logits.shape}"
+        # HF-compatible tuple output
+        assert isinstance(output, tuple)
+        attn_output = output[0]
+        assert attn_output is not None, "attn_output must not be None"
+        assert attn_output.shape == (1, 32, num_heads * head_dim), (
+            f"Unexpected output shape: {attn_output.shape}"
         )
 
-        # Verify no layer has gate_target computation active
-        for idx, tasft_attn in patched.items():
-            assert not tasft_attn.compute_gate_target, (
-                f"Layer {idx} should have compute_gate_target=False in inference mode"
-            )
+    def test_output_shape_unchanged(self) -> None:
+        """TASFTAttention output hidden_states shape must match base attention output shape."""
+        num_heads, head_dim = 4, 32
+        hidden_dim = num_heads * head_dim
+        base_attn = _MockBaseAttn(num_heads, head_dim)
 
-    def test_output_shape_unchanged(
-        self, tiny_gate_config: GateConfig,
-    ) -> None:
-        """TASFTAttention output logits shape must match original model output shape."""
-        # Get original output shape
-        original_model = GPT2LMHeadModel(_TINY_GPT2_CONFIG)
-        input_ids = torch.randint(0, 512, (2, 16))
+        hidden = torch.randn(2, 16, hidden_dim)
         with torch.no_grad():
-            original_output = original_model(input_ids)
-        original_shape = original_output.logits.shape
+            original_out = base_attn(hidden, output_attentions=False)
+        original_shape = original_out[0].shape
 
-        # Patch a fresh model and get new output shape
-        patched_model = GPT2LMHeadModel(_TINY_GPT2_CONFIG)
-        patch_model_attention(patched_model, tiny_gate_config)
+        gate = AttnGate(
+            num_heads=num_heads, head_dim=head_dim,
+            block_size=8, gate_hidden_dim=16, default_threshold=0.5,
+        )
+        tasft_attn = TASFTAttention(
+            base_attn=base_attn, gate=gate,
+            layer_idx=LayerIndex(0), compute_gate_target=False,
+        )
+        tasft_attn.eval()
         with torch.no_grad():
-            patched_output = patched_model(input_ids)
-        patched_shape = patched_output.logits.shape
+            tasft_out = tasft_attn(hidden)
 
-        assert original_shape == patched_shape, (
-            f"Shape mismatch: original={original_shape}, patched={patched_shape}"
+        assert original_shape == tasft_out[0].shape, (
+            f"Shape mismatch: original={original_shape}, "
+            f"tasft={tasft_out[0].shape}"
         )
 
     def test_set_active_gate_layers(
-        self, tiny_model: GPT2LMHeadModel, tiny_gate_config: GateConfig
+        self, tiny_model: GPT2LMHeadModel, tiny_gate_config: GateConfig,
     ) -> None:
         """Only specified active layers should have compute_gate_target=True."""
         patched = patch_model_attention(tiny_model, tiny_gate_config)
 
-        # Activate only layer 0
         patched[0].set_training_mode(True)
         patched[1].set_training_mode(False)
 
@@ -215,7 +260,6 @@ class TestPatchModelAttention:
             "Layer 1 should have compute_gate_target=False"
         )
 
-        # Switch: activate only layer 1
         patched[0].set_training_mode(False)
         patched[1].set_training_mode(True)
 
@@ -226,45 +270,37 @@ class TestPatchModelAttention:
             "Layer 1 should now have compute_gate_target=True"
         )
 
-    def test_output_close_to_dense(
-        self, tiny_gate_config: GateConfig,
-    ) -> None:
-        """TASFTAttention with threshold=0 (all blocks active) should produce output
-        close to original dense attention, verifying gate doesn't corrupt computation.
+    def test_output_close_to_dense(self) -> None:
+        """TASFTAttention in inference mode must produce output identical to base
+        attention, verifying the wrapper doesn't corrupt the computation."""
+        num_heads, head_dim = 4, 32
+        hidden_dim = num_heads * head_dim
+        base_attn = _MockBaseAttn(num_heads, head_dim)
 
-        In inference mode (compute_gate_target=False), TASFTAttention delegates
-        to base_attn directly. With identical weights, output must match.
-        """
         torch.manual_seed(42)
-        input_ids = torch.randint(0, 512, (1, 32))
+        hidden = torch.randn(1, 32, hidden_dim)
 
-        # Original model output
-        torch.manual_seed(0)
-        original_model = GPT2LMHeadModel(_TINY_GPT2_CONFIG)
-        original_model.eval()
+        # Original output from base_attn directly
         with torch.no_grad():
-            original_out = original_model(input_ids).logits
+            original_out = base_attn(hidden, output_attentions=False)[0]
 
-        # Patched model with same weights (same seed)
-        torch.manual_seed(0)
-        patched_model = GPT2LMHeadModel(_TINY_GPT2_CONFIG)
-
-        zero_threshold_config = GateConfig(
-            block_size=8,
-            num_layers=2,
-            gate_hidden_dim=16,
-            default_threshold=0.0,
+        # TASFTAttention wrapping the SAME base_attn module
+        gate = AttnGate(
+            num_heads=num_heads, head_dim=head_dim,
+            block_size=8, gate_hidden_dim=16, default_threshold=0.0,
         )
-        patch_model_attention(patched_model, zero_threshold_config)
-        patched_model.eval()
+        tasft_attn = TASFTAttention(
+            base_attn=base_attn, gate=gate,
+            layer_idx=LayerIndex(0), compute_gate_target=False,
+        )
+        tasft_attn.eval()
 
         with torch.no_grad():
-            patched_out = patched_model(input_ids).logits
+            tasft_out = tasft_attn(hidden)
 
-        # In inference mode, TASFTAttention runs base attention forward directly.
-        # Output should be identical (same weights, same input).
-        max_error = (original_out - patched_out).abs().max().item()
-        assert max_error < 1e-2, (
+        # Same module + same input -> identical output
+        max_error = (original_out - tasft_out[0]).abs().max().item()
+        assert max_error < 1e-5, (
             f"Dense-path output diverges from original by {max_error:.6f}, "
-            f"expected < 1e-2. Gate may be corrupting the attention computation."
+            f"expected < 1e-5. Wrapper corrupted the attention output."
         )

@@ -21,16 +21,21 @@ class TestBundleSchemaPlaceholder:
     """Placeholder tests awaiting bundle schema implementation."""
 
     def test_valid_construction_json_roundtrip(self) -> None:
-        raise NotImplementedError("Awaiting bundle schema module")
+        msg = "Awaiting bundle schema module"
+        raise NotImplementedError(msg)
 
     def test_invalid_sha256_raises(self) -> None:
-        raise NotImplementedError("Awaiting bundle schema module")
+        msg = "Awaiting bundle schema module"
+        raise NotImplementedError(msg)
 
     def test_layer_idx_mismatch_raises(self) -> None:
-        raise NotImplementedError("Awaiting bundle schema module")
+        msg = "Awaiting bundle schema module"
+        raise NotImplementedError(msg)
 
     def test_frozen_mutation_raises(self) -> None:
-        raise NotImplementedError("Awaiting bundle schema module")
+        msg = "Awaiting bundle schema module"
+        raise NotImplementedError(msg)
 
     def test_extra_fields_rejected(self) -> None:
-        raise NotImplementedError("Awaiting bundle schema module")
+        msg = "Awaiting bundle schema module"
+        raise NotImplementedError(msg)

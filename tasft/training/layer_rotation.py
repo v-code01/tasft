@@ -27,7 +27,7 @@ Complexity: O(L) per step for all strategies.
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from enum import Enum, auto
 from typing import Final
 
@@ -114,15 +114,19 @@ class LayerRotationScheduler:
         seed: int = 42,
     ) -> None:
         if num_layers <= 0:
-            raise ValueError(f"num_layers must be > 0, got {num_layers}")
+            msg = f"num_layers must be > 0, got {num_layers}"
+            raise ValueError(msg)
         if layers_per_step <= 0:
-            raise ValueError(f"layers_per_step must be > 0, got {layers_per_step}")
+            msg = f"layers_per_step must be > 0, got {layers_per_step}"
+            raise ValueError(msg)
         if layers_per_step > num_layers:
+            msg = f"layers_per_step ({layers_per_step}) must be <= num_layers ({num_layers})"
             raise ValueError(
-                f"layers_per_step ({layers_per_step}) must be <= num_layers ({num_layers})"
+                msg,
             )
         if not 0.0 < ema_alpha <= 1.0:
-            raise ValueError(f"ema_alpha must be in (0, 1], got {ema_alpha}")
+            msg = f"ema_alpha must be in (0, 1], got {ema_alpha}"
+            raise ValueError(msg)
 
         self._num_layers: Final[int] = num_layers
         self._layers_per_step: Final[int] = layers_per_step
@@ -134,8 +138,12 @@ class LayerRotationScheduler:
         self._rng.manual_seed(seed)
 
         # Per-layer tracking
-        self._last_calibrated: list[int] = [-1] * num_layers  # step at which each layer was last active
-        self._ema_gate_loss: torch.Tensor = torch.ones(num_layers, dtype=torch.float64)  # uniform prior
+        # step at which each layer was last active
+        self._last_calibrated: list[int] = [-1] * num_layers
+        # uniform prior
+        self._ema_gate_loss: torch.Tensor = torch.ones(
+            num_layers, dtype=torch.float64,
+        )
 
     @property
     def num_layers(self) -> int:
@@ -176,7 +184,8 @@ class LayerRotationScheduler:
         elif self._strategy == RotationStrategy.PRIORITY_WEIGHTED:
             selected = self._priority_weighted()
         else:
-            raise ValueError(f"Unknown strategy: {self._strategy}")
+            msg = f"Unknown strategy: {self._strategy}"
+            raise ValueError(msg)
 
         # Update tracking state
         for idx in selected:
@@ -195,7 +204,8 @@ class LayerRotationScheduler:
         Complexity: O(1).
         """
         if not 0 <= layer_idx < self._num_layers:
-            raise ValueError(f"layer_idx {layer_idx} out of range [0, {self._num_layers})")
+            msg = f"layer_idx {layer_idx} out of range [0, {self._num_layers})"
+            raise ValueError(msg)
         self._ema_gate_loss[layer_idx] = (
             self._ema_alpha * loss + (1.0 - self._ema_alpha) * self._ema_gate_loss[layer_idx]
         )

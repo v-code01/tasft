@@ -29,25 +29,28 @@ from __future__ import annotations
 
 import json
 import os
+import warnings
 from dataclasses import dataclass, field
-from typing import Any, Optional, Union
+from typing import TYPE_CHECKING, Any
 
 import structlog
 import torch
-import torch.nn as nn
+from torch import nn
 from torch.optim.lr_scheduler import LambdaLR
 from transformers import Trainer, TrainingArguments
-from transformers.modeling_utils import PreTrainedModel
 
 from tasft.exceptions import NaNDetectedError, TrainingError
-from tasft.modules.attn_gate import AttnGate
-from tasft.modules.tasft_attention import TASFTAttention
 from tasft.training.layer_rotation import (
     LayerRotationScheduler,
     RotationStrategy,
 )
 from tasft.training.objectives import ObjectiveLossOutput, TASFTObjective
 from tasft.types import LayerIndex, SparsityProfile, SparsityRatio
+
+if TYPE_CHECKING:
+    from transformers.modeling_utils import PreTrainedModel
+
+    from tasft.modules.tasft_attention import TASFTAttention
 
 logger = structlog.get_logger("tasft.training.trainer")
 
@@ -114,23 +117,33 @@ class TASFTTrainingArguments(TrainingArguments):
         """Validate TASFT-specific arguments after HF validation."""
         super().__post_init__()
         if not 0.0 < self.lambda_gate <= 10.0:
-            raise ValueError(f"lambda_gate must be in (0, 10], got {self.lambda_gate}")
+            msg = f"lambda_gate must be in (0, 10], got {self.lambda_gate}"
+            raise ValueError(msg)
         if not 0.0 < self.tau_target < 1.0:
-            raise ValueError(f"tau_target must be in (0, 1), got {self.tau_target}")
+            msg = f"tau_target must be in (0, 1), got {self.tau_target}"
+            raise ValueError(msg)
         if not 0.0 < self.gate_lr_ratio <= 1.0:
-            raise ValueError(f"gate_lr_ratio must be in (0, 1], got {self.gate_lr_ratio}")
+            msg = f"gate_lr_ratio must be in (0, 1], got {self.gate_lr_ratio}"
+            raise ValueError(msg)
         if self.beta_sparse < 0.0:
-            raise ValueError(f"beta_sparse must be >= 0, got {self.beta_sparse}")
+            msg = f"beta_sparse must be >= 0, got {self.beta_sparse}"
+            raise ValueError(msg)
         if self.gate_warmup_steps < 0:
-            raise ValueError(f"gate_warmup_steps must be >= 0, got {self.gate_warmup_steps}")
+            msg = f"gate_warmup_steps must be >= 0, got {self.gate_warmup_steps}"
+            raise ValueError(msg)
         if self.layers_per_step <= 0:
-            raise ValueError(f"layers_per_step must be > 0, got {self.layers_per_step}")
+            msg = f"layers_per_step must be > 0, got {self.layers_per_step}"
+            raise ValueError(msg)
         if self.block_size <= 0:
-            raise ValueError(f"block_size must be > 0, got {self.block_size}")
+            msg = f"block_size must be > 0, got {self.block_size}"
+            raise ValueError(msg)
         if self.rotation_strategy not in _ROTATION_STRATEGY_MAP:
-            raise ValueError(
+            msg = (
                 f"rotation_strategy must be one of {list(_ROTATION_STRATEGY_MAP.keys())}, "
                 f"got '{self.rotation_strategy}'"
+            )
+            raise ValueError(
+                msg,
             )
 
 
@@ -160,7 +173,7 @@ class TASFTTrainer(Trainer):
 
     def __init__(
         self,
-        model: Union[PreTrainedModel, nn.Module],
+        model: PreTrainedModel | nn.Module,
         args: TASFTTrainingArguments,
         patched_layers: dict[int, TASFTAttention],
         **kwargs: Any,
@@ -196,7 +209,7 @@ class TASFTTrainer(Trainer):
         )
 
         # Gate warmup LR scheduler (created in create_optimizer)
-        self._gate_lr_scheduler: Optional[LambdaLR] = None
+        self._gate_lr_scheduler: LambdaLR | None = None
 
         logger.info(
             "tasft_trainer_init",
@@ -321,8 +334,8 @@ class TASFTTrainer(Trainer):
     def training_step(
         self,
         model: nn.Module,
-        inputs: dict[str, Union[torch.Tensor, Any]],
-        num_items_in_batch: Optional[int] = None,
+        inputs: dict[str, torch.Tensor | Any],
+        num_items_in_batch: int | None = None,
     ) -> torch.Tensor:
         """Execute one TASFT co-training step.
 
@@ -361,8 +374,9 @@ class TASFTTrainer(Trainer):
         inputs = self._prepare_inputs(inputs)
         labels = inputs.get("labels")
         if labels is None:
+            msg = "Labels must be provided in inputs for TASFT training"
             raise TrainingError(
-                "Labels must be provided in inputs for TASFT training",
+                msg,
                 context={"input_keys": list(inputs.keys())},
             )
 
@@ -415,8 +429,9 @@ class TASFTTrainer(Trainer):
 
         # NaN guard
         if not torch.isfinite(loss):
+            msg = "Non-finite loss detected in training_step"
             raise NaNDetectedError(
-                "Non-finite loss detected in training_step",
+                msg,
                 context={
                     "global_step": global_step,
                     "loss_value": loss.item() if loss.numel() == 1 else "multi-element",
@@ -430,17 +445,32 @@ class TASFTTrainer(Trainer):
                 self._rotation_scheduler.report_gate_loss(int(li), gate_loss_val)
 
         # Step 7: Step gate warmup scheduler
+        # Suppress PyTorch warning about lr_scheduler.step() before optimizer.step():
+        # the HF Trainer calls optimizer.step() AFTER training_step() returns, so the
+        # gate LR scheduler step necessarily precedes the first optimizer.step(). This
+        # ordering is intentional — the scheduler adjusts gate LR for the NEXT step.
         if self._gate_lr_scheduler is not None:
-            self._gate_lr_scheduler.step()
+            with warnings.catch_warnings():
+                warnings.filterwarnings(
+                    "ignore",
+                    message="Detected call of `lr_scheduler.step\\(\\)` before",
+                    category=UserWarning,
+                )
+                self._gate_lr_scheduler.step()
 
         # Step 8: Structured logging
         self._log_training_step(global_step, loss, loss_output, active_indices)
 
-        # Gradient accumulation scaling
-        if num_items_in_batch is not None and self.args.gradient_accumulation_steps > 1:
-            loss = loss / self.args.gradient_accumulation_steps
+        # Normalize loss for gradient accumulation (matches HF Trainer convention)
+        loss = loss / self.args.gradient_accumulation_steps
 
-        return loss
+        # Backward pass: HF Trainer expects training_step to call backward() internally.
+        # During gate warmup with no LoRA adapters, the task-only loss may have no grad_fn
+        # (all base params frozen). Guard against backward on a non-differentiable tensor.
+        if loss.requires_grad:
+            self.accelerator.backward(loss)
+
+        return loss.detach()
 
     def _get_gate_warmup_multiplier(self, global_step: int) -> float:
         """Compute gate loss multiplier based on warmup schedule.
@@ -465,8 +495,8 @@ class TASFTTrainer(Trainer):
         return min(1.0, ramp / max(1, warmup))
 
     def _extract_gate_output(
-        self, model: nn.Module, layer_idx: int
-    ) -> Optional[torch.Tensor]:
+        self, model: nn.Module, layer_idx: int,
+    ) -> torch.Tensor | None:
         """Extract gate soft scores from a patched layer after forward pass.
 
         The TASFTAttention module stores its last gate output. We access it
@@ -491,8 +521,8 @@ class TASFTTrainer(Trainer):
         return None
 
     def _extract_attn_scores(
-        self, model: nn.Module, layer_idx: int
-    ) -> Optional[torch.Tensor]:
+        self, model: nn.Module, layer_idx: int,
+    ) -> torch.Tensor | None:
         """Extract full attention scores from a patched layer after forward pass.
 
         Args:
@@ -506,14 +536,13 @@ class TASFTTrainer(Trainer):
         if tasft_attn is None:
             return None
 
-        last_attn_weights = getattr(tasft_attn, "_last_attn_weights", None)
-        return last_attn_weights
+        return getattr(tasft_attn, "_last_attn_weights", None)
 
     def _log_training_step(
         self,
         global_step: int,
         loss: torch.Tensor,
-        loss_output: Optional[ObjectiveLossOutput],
+        loss_output: ObjectiveLossOutput | None,
         active_layers: list[int],
     ) -> None:
         """Emit structured log for a training step.
@@ -582,7 +611,6 @@ class TASFTTrainer(Trainer):
         self,
         model: nn.Module,
         trial: Any,
-        metrics: Optional[dict[str, float]] = None,
     ) -> None:
         """Save 3-artifact checkpoint: LoRA + gates + sparsity profile.
 
@@ -597,10 +625,9 @@ class TASFTTrainer(Trainer):
         Args:
             model: The model to checkpoint.
             trial: Optuna trial (if hyperparameter search).
-            metrics: Evaluation metrics dict.
         """
         # Standard HF checkpoint (saves LoRA via PEFT integration)
-        super()._save_checkpoint(model, trial, metrics=metrics)
+        super()._save_checkpoint(model, trial)
 
         # Determine checkpoint directory
         checkpoint_dir = self._get_last_checkpoint_dir()
@@ -648,13 +675,15 @@ class TASFTTrainer(Trainer):
             num_layers_profiled=len(sparsity_profile),
         )
 
-    def _get_last_checkpoint_dir(self) -> Optional[str]:
+    def _get_last_checkpoint_dir(self) -> str | None:
         """Get the most recent checkpoint directory path.
 
         Returns:
             Checkpoint directory path or None if not determinable.
         """
         output_dir = self.args.output_dir
+        if output_dir is None:
+            return None
         step = self.state.global_step
         checkpoint_dir = os.path.join(output_dir, f"checkpoint-{step}")
         if os.path.isdir(checkpoint_dir):
@@ -667,7 +696,13 @@ class TASFTTrainer(Trainer):
                 if d.startswith("checkpoint-") and os.path.isdir(os.path.join(output_dir, d))
             ]
             if candidates:
-                candidates.sort(key=lambda d: int(d.split("-")[-1]) if d.split("-")[-1].isdigit() else 0)
+                candidates.sort(
+                    key=lambda d: (
+                        int(d.split("-")[-1])
+                        if d.split("-")[-1].isdigit()
+                        else 0
+                    ),
+                )
                 return os.path.join(output_dir, candidates[-1])
         return None
 
@@ -704,8 +739,8 @@ class TASFTTrainer(Trainer):
 
         # Accumulate gate activations per layer
         # Using Kahan summation for numerical stability
-        layer_activation_sum: dict[int, float] = {idx: 0.0 for idx in self._patched_layers}
-        layer_activation_comp: dict[int, float] = {idx: 0.0 for idx in self._patched_layers}
+        layer_activation_sum: dict[int, float] = dict.fromkeys(self._patched_layers, 0.0)
+        layer_activation_comp: dict[int, float] = dict.fromkeys(self._patched_layers, 0.0)
         num_batches = 0
 
         model.eval()
@@ -748,8 +783,8 @@ class TASFTTrainer(Trainer):
 
     def evaluate(
         self,
-        eval_dataset: Optional[Any] = None,
-        ignore_keys: Optional[list[str]] = None,
+        eval_dataset: Any | None = None,
+        ignore_keys: list[str] | None = None,
         metric_key_prefix: str = "eval",
     ) -> dict[str, float]:
         """Evaluate with additional gate metrics.
@@ -780,7 +815,7 @@ class TASFTTrainer(Trainer):
         metrics[f"{metric_key_prefix}_gate_fully_covered"] = float(coverage.fully_covered)
 
         # Compute sparsity profile if eval data available
-        if self.eval_dataset is not None:
+        if self.eval_dataset is not None and self.model is not None:
             sparsity_profile = self._compute_sparsity_profile(self.model)
             if sparsity_profile:
                 sparsity_values = [float(v) for v in sparsity_profile.values()]

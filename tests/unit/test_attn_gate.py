@@ -15,12 +15,12 @@ Coverage target: 100% for all mathematical operations in AttnGate
 """
 import pytest
 import torch
-import torch.nn as nn
-from hypothesis import given, settings, strategies as st
+from hypothesis import given, settings
+from hypothesis import strategies as st
+from torch import nn
 
 from tasft.exceptions import ValidationError
 from tasft.modules.attn_gate import AttnGate, GateOutput
-
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -121,7 +121,7 @@ class TestGateOutputShape:
     """Verify output tensor shapes across configurations."""
 
     @pytest.mark.parametrize(
-        "B,H,S,D,block_size",
+        ("B", "H", "S", "D", "block_size"),
         [
             (1, 4, 64, 32, 8),
             (2, 8, 128, 64, 16),
@@ -286,7 +286,7 @@ class TestNonDivisibleSeqLen:
     """Gate must handle seq_len not divisible by block_size via padding."""
 
     @pytest.mark.parametrize(
-        "S,block_size",
+        ("S", "block_size"),
         [
             (65, 64),  # 1 extra token
             (100, 64),  # 36 extra tokens
@@ -492,7 +492,7 @@ class TestGateProperties:
     )
     @settings(max_examples=50, deadline=10000)
     def test_gate_output_shape_property(
-        self, B: int, H: int, S: int, D: int, block_size: int
+        self, B: int, H: int, S: int, D: int, block_size: int,
     ) -> None:
         """For all valid (B, H, S, D, block_size): output shape is correct."""
         gate = AttnGate(num_heads=H, head_dim=D, block_size=block_size)
@@ -512,7 +512,7 @@ class TestGateProperties:
     )
     @settings(max_examples=30, deadline=10000)
     def test_soft_scores_always_in_unit_interval_property(
-        self, B: int, H: int, S: int, D: int, block_size: int
+        self, B: int, H: int, S: int, D: int, block_size: int,
     ) -> None:
         """Sigmoid guarantees [0, 1] for all valid inputs."""
         gate = AttnGate(num_heads=H, head_dim=D, block_size=block_size)

@@ -26,7 +26,7 @@ Complexity: O(B·H·S²/block_size² + B·S·V) per forward pass.
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Final
 
 import torch
@@ -64,13 +64,18 @@ class ObjectiveLossOutput:
     active_layers: list[LayerIndex]
 
 
-def _check_finite(tensor: torch.Tensor, name: str, context: dict[str, object] | None = None) -> None:
+def _check_finite(
+    tensor: torch.Tensor,
+    name: str,
+    context: dict[str, object] | None = None,
+) -> None:
     """Guard against NaN/Inf in tensors. Raises NaNDetectedError with structured context."""
     if not torch.isfinite(tensor).all():
         has_nan = bool(torch.isnan(tensor).any())
         has_inf = bool(torch.isinf(tensor).any())
+        msg = f"Non-finite values detected in {name}: NaN={has_nan}, Inf={has_inf}"
         raise NaNDetectedError(
-            f"Non-finite values detected in {name}: NaN={has_nan}, Inf={has_inf}",
+            msg,
             context={
                 "tensor_name": name,
                 "has_nan": has_nan,
@@ -103,13 +108,17 @@ class TASFTObjective:
         label_smoothing: float = 0.0,
     ) -> None:
         if not 0.0 < lambda_gate <= 10.0:
-            raise ValueError(f"lambda_gate must be in (0, 10], got {lambda_gate}")
+            msg = f"lambda_gate must be in (0, 10], got {lambda_gate}"
+            raise ValueError(msg)
         if beta_sparse < 0.0:
-            raise ValueError(f"beta_sparse must be >= 0, got {beta_sparse}")
+            msg = f"beta_sparse must be >= 0, got {beta_sparse}"
+            raise ValueError(msg)
         if not 0.0 < tau_target < 1.0:
-            raise ValueError(f"tau_target must be in (0, 1), got {tau_target}")
+            msg = f"tau_target must be in (0, 1), got {tau_target}"
+            raise ValueError(msg)
         if not 0.0 <= label_smoothing < 1.0:
-            raise ValueError(f"label_smoothing must be in [0, 1), got {label_smoothing}")
+            msg = f"label_smoothing must be in [0, 1), got {label_smoothing}"
+            raise ValueError(msg)
 
         self._lambda_gate: Final[float] = lambda_gate
         self._beta_sparse: Final[float] = beta_sparse
@@ -133,10 +142,30 @@ class TASFTObjective:
 
         Complexity: O(B·H·S²) for the maxpool, O(B·H·NB_q·NB_k) for softmax.
         """
-        _check_finite(attn_scores, "attn_scores")
+        # Allow -inf from causal masking (standard in pre-softmax attention scores).
+        # Reject NaN and +inf which indicate actual numerical corruption.
+        # Maxpool naturally handles -inf (takes max), softmax maps -inf → 0.
+        has_nan = bool(torch.isnan(attn_scores).any())
+        has_pos_inf = bool((attn_scores == float("inf")).any())
+        if has_nan or has_pos_inf:
+            msg = (
+                f"Non-finite values detected in attn_scores: "
+                f"NaN={has_nan}, Inf={has_pos_inf}"
+            )
+            raise NaNDetectedError(
+                msg,
+                context={
+                    "tensor_name": "attn_scores",
+                    "has_nan": has_nan,
+                    "has_inf": has_pos_inf,
+                    "shape": list(attn_scores.shape),
+                    "dtype": str(attn_scores.dtype),
+                },
+            )
         b, h, s_q, s_k = attn_scores.shape
         if block_size <= 0:
-            raise ValueError(f"block_size must be > 0, got {block_size}")
+            msg = f"block_size must be > 0, got {block_size}"
+            raise ValueError(msg)
 
         # Pad to make dimensions divisible by block_size
         pad_q = (block_size - s_q % block_size) % block_size
@@ -156,7 +185,10 @@ class TASFTObjective:
         return target.reshape(b, h, nb_q, nb_k)
 
     @staticmethod
-    def compute_gate_loss(gate_soft_scores: SoftGateScores, gate_target: torch.Tensor) -> torch.Tensor:
+    def compute_gate_loss(
+        gate_soft_scores: SoftGateScores,
+        gate_target: torch.Tensor,
+    ) -> torch.Tensor:
         """KL divergence between predicted gate distribution and ground-truth block importance.
 
         Uses KL(target || gate) = sum(target * (log(target) - log(gate))).

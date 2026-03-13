@@ -1,40 +1,37 @@
 """
-Integration test: TASFT bundle export and inference pipeline.
+Integration test: TASFT inference pipeline.
 
-Tests the full train -> export -> load -> inference flow using a tiny model.
-The inference pipeline test validates bundle integrity, artifact structure,
-and numerical correctness of the loaded model.
+Tests model patching, gate extraction, bundle validation, and
+forward pass correctness using the TinyCausalLM from conftest.
 
 Timeout: 120s for the full pipeline test.
 """
 from __future__ import annotations
 
-import json
-from pathlib import Path
+from typing import TYPE_CHECKING
 
 import pytest
 import torch
-import torch.nn as nn
+from torch import nn
 from torch.utils.data import Dataset
-from transformers import GPT2Config, GPT2LMHeadModel
 
-from tasft.bundle.bundle_schema import BundleManifest, KernelConfig
-from tasft.bundle.export import BundleExporter, ExportConfig, ValidationResult
-from tasft.exceptions import BundleError
-from tasft.modules import AttnGate, GateConfig, patch_model_attention
+from tasft.bundle.export import BundleExporter
+from tasft.modules import GateConfig, TASFTAttention, patch_model_attention
 from tasft.training import TASFTTrainer, TASFTTrainingArguments
 
+if TYPE_CHECKING:
+    from pathlib import Path
 
-TINY_CONFIG = GPT2Config(
-    n_layer=2,
-    n_head=4,
-    n_embd=128,
-    n_positions=64,
-    vocab_size=256,
-    attn_pdrop=0.0,
-    resid_pdrop=0.0,
-    embd_pdrop=0.0,
-)
+    from tests.integration.conftest import TinyCausalLM
+
+
+def _freeze_and_patch(
+    model: nn.Module, gate_config: GateConfig,
+) -> dict[int, TASFTAttention]:
+    """Freeze all base params and patch attention with gates."""
+    for p in model.parameters():
+        p.requires_grad = False
+    return patch_model_attention(model, gate_config)
 
 
 class TinyDS(Dataset):
@@ -42,7 +39,7 @@ class TinyDS(Dataset):
 
     def __init__(self) -> None:
         torch.manual_seed(77)
-        self._ids = torch.randint(0, 256, (20, 64))
+        self._ids = torch.randint(0, 128, (20, 64))
 
     def __len__(self) -> int:
         return 20
@@ -57,20 +54,19 @@ class TinyDS(Dataset):
 
 @pytest.mark.integration
 @pytest.mark.timeout(120)
-def test_bundle_export_produces_valid_structure(tmp_path: Path) -> None:
-    """Train tiny model -> export bundle -> validate bundle structure.
+def test_train_and_extract_gate_state(
+    tiny_model: TinyCausalLM,
+    gate_config: GateConfig,
+    tmp_path: Path,
+) -> None:
+    """Train tiny model -> extract gate state dicts from all layers.
 
     Verifies:
-    - manifest.json exists and contains valid metadata
-    - kernel_config.json exists with per-layer configs
-    - Gate safetensors files exist for each layer
-    - All checksums in manifest are valid SHA-256 hex strings
+    - Gate parameters are extractable after training
+    - Each layer has gate parameters
+    - Gate state dicts are non-empty
     """
-    torch.manual_seed(42)
-    model = GPT2LMHeadModel(TINY_CONFIG)
-
-    gate_config = GateConfig(block_size=8, num_layers=2, gate_hidden_dim=8)
-    patched_layers = patch_model_attention(model, gate_config)
+    patched_layers = _freeze_and_patch(tiny_model, gate_config)
 
     args = TASFTTrainingArguments(
         output_dir=str(tmp_path / "train"),
@@ -79,23 +75,20 @@ def test_bundle_export_produces_valid_structure(tmp_path: Path) -> None:
         learning_rate=1e-3,
         lambda_gate=0.1,
         tau_target=0.8,
-        no_cuda=True,
+        use_cpu=True,
         dataloader_num_workers=0,
         report_to="none",
     )
 
     trainer = TASFTTrainer(
-        model=model,
+        model=tiny_model,
         args=args,
         patched_layers=patched_layers,
         train_dataset=TinyDS(),
     )
     trainer.train()
 
-    # Save checkpoint and verify sparsity profile
-    checkpoint_dirs = list((tmp_path / "train").glob("checkpoint-*"))
-    # Even without explicit save_steps=5, we can verify the trainer ran
-    # The key integration: verify gate state is extractable
+    # Verify gate state is extractable
     gate_states: dict[str, torch.Tensor] = {}
     for idx, tasft_attn in patched_layers.items():
         for name, param in tasft_attn.gate.state_dict().items():
@@ -103,8 +96,8 @@ def test_bundle_export_produces_valid_structure(tmp_path: Path) -> None:
 
     assert len(gate_states) > 0, "No gate parameters extracted"
 
-    # Verify each gate has the expected parameter structure
-    for idx in range(2):
+    # Verify each layer has parameters
+    for idx in range(4):
         prefix = f"layer_{idx}.gate."
         layer_params = {k: v for k, v in gate_states.items() if k.startswith(prefix)}
         assert len(layer_params) > 0, f"No parameters for gate at layer {idx}"
@@ -117,7 +110,6 @@ def test_bundle_validation_rejects_corrupted_manifest(tmp_path: Path) -> None:
     bundle_dir = tmp_path / "bad_bundle"
     bundle_dir.mkdir()
 
-    # Write an invalid manifest
     (bundle_dir / "manifest.json").write_text('{"invalid": true}')
     (bundle_dir / "model").mkdir()
     (bundle_dir / "gates").mkdir()
@@ -141,18 +133,17 @@ def test_bundle_validation_rejects_missing_manifest(tmp_path: Path) -> None:
 
 @pytest.mark.integration
 @pytest.mark.timeout(60)
-def test_gate_output_shape_consistency_after_training(tmp_path: Path) -> None:
+def test_gate_output_shape_consistency_after_training(
+    tiny_model: TinyCausalLM,
+    gate_config: GateConfig,
+    tmp_path: Path,
+) -> None:
     """After training, gate forward produces correct output shapes.
 
     Verifies that the trained gate modules produce outputs with shapes
     matching the expected block grid dimensions for the configured block_size.
     """
-    torch.manual_seed(42)
-    model = GPT2LMHeadModel(TINY_CONFIG)
-
-    block_size = 8
-    gate_config = GateConfig(block_size=block_size, num_layers=2, gate_hidden_dim=8)
-    patched_layers = patch_model_attention(model, gate_config)
+    patched_layers = _freeze_and_patch(tiny_model, gate_config)
 
     args = TASFTTrainingArguments(
         output_dir=str(tmp_path / "train"),
@@ -161,24 +152,25 @@ def test_gate_output_shape_consistency_after_training(tmp_path: Path) -> None:
         learning_rate=1e-3,
         lambda_gate=0.1,
         tau_target=0.8,
-        no_cuda=True,
+        use_cpu=True,
         dataloader_num_workers=0,
         report_to="none",
     )
 
     trainer = TASFTTrainer(
-        model=model,
+        model=tiny_model,
         args=args,
         patched_layers=patched_layers,
         train_dataset=TinyDS(),
     )
     trainer.train()
 
-    # Verify gate forward produces correct shapes
+    # Gate config: block_size=32, num_heads=4, head_dim=16
     seq_len = 64
     num_heads = 4
-    head_dim = 32  # 128 / 4
-    num_blocks = seq_len // block_size  # 64 / 8 = 8
+    head_dim = 16
+    block_size = gate_config.block_size
+    num_blocks = seq_len // block_size  # 64 / 32 = 2
 
     for idx, tasft_attn in patched_layers.items():
         gate = tasft_attn.gate
@@ -200,25 +192,46 @@ def test_gate_output_shape_consistency_after_training(tmp_path: Path) -> None:
 
 @pytest.mark.integration
 @pytest.mark.timeout(60)
-def test_model_forward_pass_after_patching(tmp_path: Path) -> None:
-    """Patched model must still produce valid logits on forward pass.
+def test_model_forward_pass_after_patching(
+    tiny_model: TinyCausalLM,
+    gate_config: GateConfig,
+) -> None:
+    """Patched model must still produce valid logits on forward pass."""
+    _freeze_and_patch(tiny_model, gate_config)
 
-    The patching should not break the model's ability to produce outputs.
-    """
-    torch.manual_seed(42)
-    model = GPT2LMHeadModel(TINY_CONFIG)
-
-    gate_config = GateConfig(block_size=8, num_layers=2, gate_hidden_dim=8)
-    patch_model_attention(model, gate_config)
-
-    input_ids = torch.randint(0, 256, (1, 32))
+    input_ids = torch.randint(0, 128, (1, 32))
     attention_mask = torch.ones(1, 32, dtype=torch.long)
 
-    model.eval()
+    tiny_model.eval()
     with torch.no_grad():
-        outputs = model(input_ids=input_ids, attention_mask=attention_mask)
+        outputs = tiny_model(input_ids=input_ids, attention_mask=attention_mask)
 
     logits = outputs.logits
-    assert logits.shape == (1, 32, 256), f"Wrong logits shape: {logits.shape}"
+    assert logits.shape == (1, 32, 128), f"Wrong logits shape: {logits.shape}"
     assert not logits.isnan().any(), "Forward pass produced NaN logits"
     assert not logits.isinf().any(), "Forward pass produced Inf logits"
+
+
+@pytest.mark.integration
+@pytest.mark.timeout(60)
+def test_forward_produces_valid_loss_with_labels(
+    tiny_model: TinyCausalLM,
+    gate_config: GateConfig,
+) -> None:
+    """Patched model with labels must produce a valid loss for backprop."""
+    _freeze_and_patch(tiny_model, gate_config)
+
+    input_ids = torch.randint(0, 128, (2, 32))
+    labels = input_ids.clone()
+    attention_mask = torch.ones(2, 32, dtype=torch.long)
+
+    outputs = tiny_model(
+        input_ids=input_ids,
+        attention_mask=attention_mask,
+        labels=labels,
+    )
+
+    assert outputs.loss is not None, "Model did not produce a loss"
+    assert outputs.loss.ndim == 0, "Loss should be scalar"
+    assert torch.isfinite(outputs.loss), f"Loss is not finite: {outputs.loss.item()}"
+    assert outputs.loss.item() > 0, "Cross-entropy loss should be positive"

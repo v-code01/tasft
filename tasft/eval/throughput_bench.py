@@ -192,10 +192,11 @@ class ThroughputBenchmark:
             BenchmarkError: If model loading fails.
         """
         try:
-            from transformers import AutoModelForCausalLM, AutoConfig
+            from transformers import AutoConfig, AutoModelForCausalLM
         except ImportError as exc:
+            msg = "transformers package required for benchmarking"
             raise BenchmarkError(
-                "transformers package required for benchmarking",
+                msg,
                 context={"missing_package": "transformers"},
             ) from exc
 
@@ -212,8 +213,9 @@ class ThroughputBenchmark:
             model.eval()
             return model, config.vocab_size
         except Exception as exc:
+            msg = f"Failed to load model: {exc}"
             raise BenchmarkError(
-                f"Failed to load model: {exc}",
+                msg,
                 context={"model_path": model_path, "error": str(exc)},
             ) from exc
 
@@ -335,14 +337,16 @@ class ThroughputBenchmark:
 
         for bs in bs_list:
             if bs <= 0:
+                msg = f"batch_size must be positive, got {bs}"
                 raise ValidationError(
-                    f"batch_size must be positive, got {bs}",
+                    msg,
                     context={"batch_sizes": bs_list},
                 )
         for sl in sl_list:
             if sl <= 0:
+                msg = f"seq_len must be positive, got {sl}"
                 raise ValidationError(
-                    f"seq_len must be positive, got {sl}",
+                    msg,
                     context={"seq_lens": sl_list},
                 )
 

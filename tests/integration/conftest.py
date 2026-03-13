@@ -8,20 +8,20 @@ from __future__ import annotations
 import shutil
 import tempfile
 from pathlib import Path
-from typing import Any, Generator
+from typing import TYPE_CHECKING, Any
 
 import pytest
 import torch
-import torch.nn as nn
+from torch import nn
 
-from tasft.modules.attn_gate import AttnGate
 from tasft.modules.tasft_attention import (
     GateConfig,
     TASFTAttention,
     patch_model_attention,
 )
-from tasft.types import LayerIndex
 
+if TYPE_CHECKING:
+    from collections.abc import Generator
 
 # ── Tiny LLaMA-like model for CPU testing ──────────────────────────────
 
@@ -60,7 +60,13 @@ class _TinyAttention(nn.Module):
         attn_weights = torch.matmul(q, k.transpose(-2, -1)) * scale
 
         # Causal mask
-        causal = torch.triu(torch.full((S, S), float("-inf"), device=hidden_states.device), diagonal=1)
+        causal = torch.triu(
+            torch.full(
+                (S, S), float("-inf"),
+                device=hidden_states.device,
+            ),
+            diagonal=1,
+        )
         attn_weights = attn_weights + causal.unsqueeze(0).unsqueeze(0)
 
         attn_probs = torch.softmax(attn_weights, dim=-1)
@@ -69,7 +75,8 @@ class _TinyAttention(nn.Module):
         out = self.o_proj(out)
 
         if output_attentions:
-            return (out, attn_weights, None)
+            # Return post-softmax weights (matching HuggingFace convention)
+            return (out, attn_probs, None)
         return (out, None, None)
 
 
@@ -97,16 +104,26 @@ class _TinyDecoderLayer(nn.Module):
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
         attn_out = self.self_attn(
-            hidden_states, attention_mask=attention_mask, output_attentions=output_attentions, **kwargs
+            hidden_states,
+            attention_mask=attention_mask,
+            output_attentions=output_attentions,
+            **kwargs,
         )
-        hidden_states = residual + attn_out[0]
+        # Handle both tuple output (original) and TASFTAttentionOutput (patched)
+        if hasattr(attn_out, "hidden_states"):
+            attn_hidden = attn_out.hidden_states
+            attn_weights = attn_out.attn_weights
+        else:
+            attn_hidden = attn_out[0]
+            attn_weights = attn_out[1] if len(attn_out) > 1 else None
+        hidden_states = residual + attn_hidden
 
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
         hidden_states = residual + self.mlp(hidden_states)
 
         if output_attentions:
-            return (hidden_states, attn_out[1])
+            return (hidden_states, attn_weights)
         return (hidden_states,)
 
 
@@ -151,7 +168,11 @@ class TinyCausalLM(nn.Module):
         all_attn_weights: list[torch.Tensor | None] = []
 
         for layer in self.model.layers:
-            layer_out = layer(hidden, attention_mask=attention_mask, output_attentions=output_attentions)
+            layer_out = layer(
+                hidden,
+                attention_mask=attention_mask,
+                output_attentions=output_attentions,
+            )
             hidden = layer_out[0]
             if output_attentions and len(layer_out) > 1:
                 all_attn_weights.append(layer_out[1])
@@ -206,7 +227,7 @@ def gate_config() -> GateConfig:
 
 @pytest.fixture
 def patched_model(
-    tiny_model: TinyCausalLM, gate_config: GateConfig
+    tiny_model: TinyCausalLM, gate_config: GateConfig,
 ) -> tuple[TinyCausalLM, dict[int, TASFTAttention]]:
     """Tiny model with all attention layers patched with TASFTAttention + AttnGate."""
     patched_layers = patch_model_attention(tiny_model, gate_config)

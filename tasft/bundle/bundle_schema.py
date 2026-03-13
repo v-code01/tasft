@@ -12,10 +12,12 @@ All schema models are frozen (immutable) and JSON-serializable.
 from __future__ import annotations
 
 import re
-from datetime import datetime
-from typing import Annotated
+from typing import TYPE_CHECKING, Annotated
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+
+if TYPE_CHECKING:
+    from datetime import datetime
 
 
 class LayerKernelConfig(BaseModel):
@@ -36,7 +38,7 @@ class LayerKernelConfig(BaseModel):
 
     layer_idx: Annotated[int, Field(ge=0, le=256)]
     threshold_tau: Annotated[
-        float, Field(gt=0.0, lt=1.0, description="Gate binarization threshold")
+        float, Field(gt=0.0, lt=1.0, description="Gate binarization threshold"),
     ]
     target_sparsity: Annotated[float, Field(ge=0.0, le=1.0)]
     achieved_sparsity_validation: Annotated[float, Field(ge=0.0, le=1.0)]
@@ -72,12 +74,14 @@ class KernelConfig(BaseModel):
         """Ensure each layer config key matches its layer_idx and block_size matches global."""
         for layer_idx, cfg in self.per_layer_config.items():
             if cfg.layer_idx != layer_idx:
+                msg = f"Layer config key {layer_idx} doesn't match cfg.layer_idx {cfg.layer_idx}"
                 raise ValueError(
-                    f"Layer config key {layer_idx} doesn't match cfg.layer_idx {cfg.layer_idx}"
+                    msg,
                 )
             if cfg.block_size != self.block_size:
+                msg = f"Layer {layer_idx} block_size {cfg.block_size} != global {self.block_size}"
                 raise ValueError(
-                    f"Layer {layer_idx} block_size {cfg.block_size} != global {self.block_size}"
+                    msg,
                 )
         return self
 
@@ -118,8 +122,9 @@ class BundleManifest(BaseModel):
         """Validate all checksums are valid SHA256 hex digests (64 lowercase hex chars)."""
         for filename, checksum in v.items():
             if not _SHA256_COMPILED.match(checksum):
+                msg = f"Invalid SHA256 checksum for {filename}: {checksum}"
                 raise ValueError(
-                    f"Invalid SHA256 checksum for {filename}: {checksum}"
+                    msg,
                 )
         return v
 

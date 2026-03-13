@@ -15,8 +15,20 @@ from pathlib import Path
 import pytest
 import torch
 
-from tasft.exceptions import NaNDetectedError, TrainingError
+from tasft.exceptions import NaNDetectedError
 from tasft.training.objectives import TASFTObjective
+
+
+def _try_create_dir(output_path_str: str, queue: multiprocessing.Queue) -> None:  # type: ignore[type-arg]
+    """Module-level function for multiprocessing pickling compatibility."""
+    try:
+        path = Path(output_path_str)
+        path.mkdir(parents=True, exist_ok=False)
+        queue.put(("success", output_path_str))
+    except FileExistsError:
+        queue.put(("conflict", output_path_str))
+    except Exception as e:
+        queue.put(("error", str(e)))
 
 
 @pytest.mark.chaos
@@ -108,7 +120,10 @@ def test_nan_in_compute_triggers_error_before_aggregation() -> None:
     labels = torch.randint(0, 256, (B, 32))
 
     with pytest.raises(NaNDetectedError):
-        obj.compute(logits, labels, gate_outputs, attn_scores, active_layer_indices=[0, 1])
+        obj.compute(
+            logits, labels, gate_outputs, attn_scores,
+            active_layer_indices=[0, 1], block_size=8,
+        )
 
 
 @pytest.mark.chaos
@@ -143,20 +158,10 @@ def test_concurrent_directory_creation_atomicity(tmp_path: Path) -> None:
     """
     results: multiprocessing.Queue[tuple[str, str]] = multiprocessing.Queue()
 
-    def try_create(output_path_str: str, queue: multiprocessing.Queue[tuple[str, str]]) -> None:
-        try:
-            path = Path(output_path_str)
-            path.mkdir(parents=True, exist_ok=False)
-            queue.put(("success", output_path_str))
-        except FileExistsError:
-            queue.put(("conflict", output_path_str))
-        except Exception as e:
-            queue.put(("error", str(e)))
-
     target = tmp_path / "bundle_race"
 
-    p1 = multiprocessing.Process(target=try_create, args=(str(target), results))
-    p2 = multiprocessing.Process(target=try_create, args=(str(target), results))
+    p1 = multiprocessing.Process(target=_try_create_dir, args=(str(target), results))
+    p2 = multiprocessing.Process(target=_try_create_dir, args=(str(target), results))
 
     p1.start()
     p2.start()
