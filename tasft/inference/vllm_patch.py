@@ -2,11 +2,15 @@
 vLLM Integration Patch for TASFT.
 
 Monkey-patches vLLM's attention backend to use AttnGate + BlockSparseFlashAttention.
-Compatible with vLLM >= 0.4.0.
+Compatible with vLLM >= 0.4.0 through 0.8.x.
 
 IMPORTANT: This patch is applied once at startup, not per-request.
            Thread-safe: uses a module-level lock for patch application.
            Does NOT break vLLM's PagedAttention KV cache management.
+
+Uses vllm_compat.py for version detection, compatibility checking, and
+attn_metadata field normalization to survive vLLM minor version bumps
+without silent breakage.
 
 Preconditions:
     - vLLM >= 0.4.0 installed and importable
@@ -29,6 +33,14 @@ import torch
 from torch import nn
 
 from tasft.exceptions import InferenceError
+from tasft.inference.vllm_compat import (
+    AttnMetadataAdapter,
+    VLLMVersion,
+    check_vllm_compatibility,
+    detect_vllm_version,
+    get_attn_metadata_adapter,
+    validate_worker_structure,
+)
 from tasft.observability.logging import get_logger
 
 if TYPE_CHECKING:
@@ -39,6 +51,9 @@ logger = get_logger("tasft.inference.vllm_patch")
 
 _patch_lock = threading.Lock()
 _patched_workers: set[int] = set()
+# Cached version detection result; populated on first patch_vllm_attention call
+_detected_version: VLLMVersion | None = None
+_version_detected: bool = False
 
 
 class TASFTvLLMAttentionBackend(nn.Module):
@@ -69,6 +84,8 @@ class TASFTvLLMAttentionBackend(nn.Module):
         num_heads: int,
         num_kv_heads: int,
         head_dim: int,
+        vllm_version: VLLMVersion | None = None,
+        adapter_cls: type[AttnMetadataAdapter] | None = None,
     ) -> None:
         """Initialize TASFT vLLM attention backend.
 
@@ -81,6 +98,8 @@ class TASFTvLLMAttentionBackend(nn.Module):
             num_heads: Number of query heads.
             num_kv_heads: Number of KV heads (for GQA).
             head_dim: Dimension per head.
+            vllm_version: Detected vLLM version for adapter dispatch.
+            adapter_cls: AttnMetadataAdapter class for normalizing field access.
         """
         super().__init__()
 
@@ -103,6 +122,10 @@ class TASFTvLLMAttentionBackend(nn.Module):
         self.head_dim = head_dim
         self._kernel: Any | None = None
         self._original_forward: Any | None = None  # Set during patching for decode delegation
+        # Version-aware metadata adapter — defaults to AttnMetadataAdapter
+        # which handles all known versions via runtime attribute probing
+        self._vllm_version = vllm_version or VLLMVersion(0, 4, 0)
+        self._adapter_cls = adapter_cls or AttnMetadataAdapter
 
     def _get_kernel(self) -> Any:
         """Lazy-load BlockSparseFlashAttention kernel.
@@ -165,8 +188,9 @@ class TASFTvLLMAttentionBackend(nn.Module):
 
         # Handle paged KV cache: if decoding with cache, prepend cached KV
         if kv_cache is not None and attn_metadata is not None:
-            is_prefill = _is_prefill_phase(attn_metadata)
-            if not is_prefill:
+            # Use version-aware adapter for safe field access across vLLM versions
+            adapted = self._adapter_cls(attn_metadata, self._vllm_version)
+            if not adapted.is_prefill:
                 # During decode, vLLM manages paging — use standard attention
                 # for single-token decode steps (no sparsity benefit at S=1)
                 return self._dense_attention_flat(query, key, value, kv_cache, attn_metadata)
@@ -286,9 +310,9 @@ class TASFTvLLMAttentionBackend(nn.Module):
 def _is_prefill_phase(attn_metadata: Any) -> bool:
     """Determine if the current attention operation is in prefill phase.
 
-    Checks vLLM attention metadata for prefill indicators. During prefill,
-    we can benefit from block-sparse attention. During decode (single token),
-    sparsity provides no benefit.
+    Delegates to AttnMetadataAdapter for version-safe field access.
+    This function is retained for backward compatibility with any external
+    code that may call it directly.
 
     Args:
         attn_metadata: vLLM attention metadata object.
@@ -298,16 +322,10 @@ def _is_prefill_phase(attn_metadata: Any) -> bool:
 
     Complexity: O(1).
     """
-    # vLLM >= 0.4.0 uses is_prompt / prefill_metadata
-    if hasattr(attn_metadata, "is_prompt"):
-        return bool(attn_metadata.is_prompt)
-    if hasattr(attn_metadata, "prefill_metadata"):
-        return attn_metadata.prefill_metadata is not None
-    # vLLM >= 0.5.0 uses num_prefill_tokens
-    if hasattr(attn_metadata, "num_prefill_tokens"):
-        return attn_metadata.num_prefill_tokens > 0
-    # Conservative default: assume prefill to enable sparse path
-    return True
+    # Use the adapter with a default version — the adapter probes attributes
+    # at runtime so the version is only used for future dispatch
+    adapted = AttnMetadataAdapter(attn_metadata, VLLMVersion(0, 4, 0))
+    return adapted.is_prefill
 
 
 def _extract_vllm_attention_modules(worker_model: nn.Module) -> list[nn.Module]:
@@ -382,6 +400,8 @@ def patch_vllm_attention(
 
     Complexity: O(L) where L = number of attention layers.
     """
+    global _detected_version, _version_detected  # noqa: PLW0603
+
     with _patch_lock:
         worker_id = id(vllm_worker)
         if worker_id in _patched_workers:
@@ -391,9 +411,77 @@ def patch_vllm_attention(
             )
             return
 
+        # --- Version detection and compatibility check (once per process) ---
+        if not _version_detected:
+            _detected_version = detect_vllm_version()
+            _version_detected = True
+
+            if _detected_version is None:
+                msg = (
+                    "vLLM is not installed or its version cannot be determined. "
+                    "patch_vllm_attention requires vLLM >= 0.4.0."
+                )
+                raise InferenceError(
+                    msg,
+                    context={"worker_type": type(vllm_worker).__name__},
+                )
+
+            logger.info(
+                "[VLLM_PATCH] Detected vLLM version",
+                vllm_version=str(_detected_version),
+                major=_detected_version.major,
+                minor=_detected_version.minor,
+                patch=_detected_version.patch,
+            )
+
+            compat_warnings = check_vllm_compatibility(_detected_version)
+            for warning_msg in compat_warnings:
+                logger.warning(
+                    "[VLLM_COMPAT] Compatibility note",
+                    warning=warning_msg,
+                    vllm_version=str(_detected_version),
+                )
+
+        # At this point _detected_version is guaranteed non-None because
+        # the first call either set it or raised InferenceError
+        assert _detected_version is not None  # noqa: S101 — invariant, not runtime check
+
+        # Resolve the adapter class for this vLLM version
+        adapter_cls = get_attn_metadata_adapter(_detected_version)
+
+        # --- Worker structure validation ---
+        structure_issues = validate_worker_structure(vllm_worker)
+        if structure_issues:
+            for issue in structure_issues:
+                logger.warning(
+                    "[VLLM_PATCH] Worker structure issue",
+                    issue=issue,
+                    worker_type=type(vllm_worker).__name__,
+                )
+            # Structure issues are warnings, not hard failures — the patching
+            # code below has its own error handling for missing attributes.
+            # Only fail if there is no model at all.
+            has_model = hasattr(vllm_worker, "model_runner") or hasattr(
+                vllm_worker, "model"
+            )
+            if not has_model:
+                msg = (
+                    "vLLM worker has no accessible model. "
+                    f"Issues: {'; '.join(structure_issues)}"
+                )
+                raise InferenceError(
+                    msg,
+                    context={
+                        "worker_type": type(vllm_worker).__name__,
+                        "issues": structure_issues,
+                        "vllm_version": str(_detected_version),
+                    },
+                )
+
         logger.info(
             "[VLLM_PATCH] Applying TASFT sparse attention patch to vLLM",
             worker_id=worker_id,
+            vllm_version=str(_detected_version),
         )
 
         # Get the model from the worker
@@ -405,7 +493,10 @@ def patch_vllm_attention(
             msg = "Cannot find model in vLLM worker — unsupported vLLM version"
             raise InferenceError(
                 msg,
-                context={"worker_type": type(vllm_worker).__name__},
+                context={
+                    "worker_type": type(vllm_worker).__name__,
+                    "vllm_version": str(_detected_version),
+                },
             )
 
         vllm_attn_modules = _extract_vllm_attention_modules(worker_model)
@@ -422,6 +513,7 @@ def patch_vllm_attention(
                 context={
                     "vllm_layers": num_vllm_layers,
                     "tasft_layers": num_tasft_layers,
+                    "vllm_version": str(_detected_version),
                 },
             )
 
@@ -441,7 +533,10 @@ def patch_vllm_attention(
                 msg = f"Cannot determine num_heads from vLLM attention module at layer {layer_idx}"
                 raise InferenceError(
                     msg,
-                    context={"module_type": type(vllm_attn).__name__},
+                    context={
+                        "module_type": type(vllm_attn).__name__,
+                        "vllm_version": str(_detected_version),
+                    },
                 )
 
             num_kv_heads = getattr(vllm_attn, "num_kv_heads", num_heads)
@@ -456,6 +551,8 @@ def patch_vllm_attention(
                 num_heads=num_heads,
                 num_kv_heads=num_kv_heads,
                 head_dim=head_dim,
+                vllm_version=_detected_version,
+                adapter_cls=adapter_cls,
             )
 
             # Store original forward on both the module (for rollback) and
@@ -515,6 +612,7 @@ def patch_vllm_attention(
             "[VLLM_PATCH] TASFT patch applied successfully",
             worker_id=worker_id,
             num_layers_patched=num_vllm_layers,
+            vllm_version=str(_detected_version),
         )
 
 

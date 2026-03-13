@@ -212,6 +212,13 @@ class TestPatchVLLMAttentionErrors:
 
         with vp._patch_lock:
             vp._patched_workers.clear()
+        # Reset version detection and mock it so tests run without vLLM installed
+        vp._version_detected = False
+        vp._detected_version = None
+        _fake = type("FakeVer", (), {"major": 0, "minor": 5, "patch": 0, "as_tuple": lambda s: (0, 5, 0), "__str__": lambda s: "0.5.0"})()
+        vp.detect_vllm_version = lambda: _fake
+        vp.check_vllm_compatibility = lambda v: []
+        vp.validate_worker_structure = lambda w: []
 
     def test_patch_already_applied_is_noop(self) -> None:
         """Calling patch when already applied logs and returns."""

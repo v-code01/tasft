@@ -75,6 +75,7 @@ class AttnGate(nn.Module):
         block_size: int = 64,
         gate_hidden_dim: int | None = None,
         default_threshold: float = 0.5,
+        is_causal: bool = True,
     ) -> None:
         """Initialize AttnGate.
 
@@ -84,6 +85,10 @@ class AttnGate(nn.Module):
             block_size: Token block size for importance scoring (default 64).
             gate_hidden_dim: Hidden dim of gate MLP. Defaults to max(32, head_dim // 4).
             default_threshold: Default tau for hard mask binarization.
+            is_causal: If True, apply lower-triangular causal constraint to block scores.
+                Blocks where query_block_idx < key_block_idx are zeroed before thresholding,
+                preventing the gate from wasting capacity learning to predict zero on blocks
+                that causal attention already masks out. Default True for decoder models.
 
         Raises:
             ValidationError: If any parameter is out of valid range.
@@ -119,6 +124,7 @@ class AttnGate(nn.Module):
         self.head_dim = head_dim
         self.block_size = block_size
         self.default_threshold = default_threshold
+        self.is_causal = is_causal
 
         _gate_hidden = gate_hidden_dim if gate_hidden_dim is not None else max(32, head_dim // 4)
         self.gate_hidden_dim = _gate_hidden
@@ -251,6 +257,21 @@ class AttnGate(nn.Module):
         logits = self.gate_proj_out(hidden).squeeze(-1)  # [B, H, NB_q, NB_k]
 
         soft_scores = torch.sigmoid(logits)  # [B, H, NB_q, NB_k] in [0, 1]
+
+        # Apply causal block constraint: zero out blocks where query_block < key_block.
+        # For causal (autoregressive) attention, token i cannot attend to token j > i.
+        # At block granularity, block_q can only attend to block_k where block_k <= block_q.
+        # This hard constraint prevents the gate MLP from wasting capacity learning
+        # to predict zero on upper-triangle blocks that causal attention already masks.
+        if self.is_causal and NB_q == NB_k:
+            # Lower-triangular mask: causal_mask[i, j] = (j <= i)
+            # Built once per forward, O(NB^2) — negligible vs attention O(S^2)
+            causal_block_mask = torch.ones(
+                NB_q, NB_k, dtype=torch.bool, device=soft_scores.device,
+            ).tril()
+            # Zero upper triangle: gate scores forced to 0 for causally-impossible blocks
+            soft_scores = soft_scores * causal_block_mask
+
         hard_mask = soft_scores >= tau  # [B, H, NB_q, NB_k] bool
 
         sparsity = SparsityRatio(1.0 - hard_mask.float().mean().item())
@@ -286,7 +307,7 @@ class AttnGate(nn.Module):
             f"num_heads={self.num_heads}, head_dim={self.head_dim}, "
             f"block_size={self.block_size}, gate_hidden_dim={self.gate_hidden_dim}, "
             f"default_threshold={self.default_threshold}, "
-            f"params={self.num_parameters}"
+            f"is_causal={self.is_causal}, params={self.num_parameters}"
         )
 
 

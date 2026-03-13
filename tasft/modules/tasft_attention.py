@@ -337,18 +337,115 @@ class TASFTAttention(nn.Module):
         position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None,
         **kwargs: Any,
     ) -> tuple[torch.Tensor, ...]:
-        """Training forward: full attention + gate prediction + gate target.
+        """Training forward: single-pass Q/K/V projection + dense attention + gate prediction.
 
-        Runs full dense attention to get both hidden_states and attention weights.
-        The attention weights are used to compute the gate distillation target.
-        The gate is also run on Q/K to produce predictions for the gate loss.
+        Computes Q, K, V once via _prepare_qkv, then:
+        1. Runs the gate on Q, K for block importance prediction
+        2. Computes dense attention manually to get both output and attention weights
+        3. Attention weights serve as gate distillation target via _compute_gate_target
+
+        This avoids the previous double-projection bug where base_attn.forward() computed
+        Q/K internally and then _extract_qk_projections ran q_proj/k_proj a second time.
 
         Stores self._last_gate_output and self._last_attn_weights for trainer extraction.
+
+        Falls back to base_attn.forward() for non-standard architectures that lack
+        q_proj/k_proj/v_proj/o_proj attributes.
+
+        Returns:
+            HF-compatible tuple (attn_output, attn_weights, past_key_value).
+
+        Complexity: O(B * H * S^2 * D) for attention + O((S/B)^2 * H) for gate.
+        """
+        attn = self.base_attn
+
+        # Guard: if base_attn lacks standard projection attributes, fall back to the
+        # old path (base_attn.forward + separate gate extraction). This handles
+        # non-standard architectures gracefully at the cost of double projection.
+        if not all(
+            hasattr(attn, proj) for proj in ("q_proj", "k_proj", "v_proj", "o_proj")
+        ):
+            return self._training_forward_fallback(
+                hidden_states=hidden_states,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                past_key_value=past_key_value,
+                use_cache=use_cache,
+                cache_position=cache_position,
+                position_embeddings=position_embeddings,
+                **kwargs,
+            )
+
+        bsz, q_len, hidden_dim = hidden_states.shape
+
+        # Single-pass Q/K/V projection — eliminates the double-projection bug
+        query_states, key_states, value_states, head_dim = self._prepare_qkv(
+            attn, hidden_states, bsz, q_len,
+            position_ids, position_embeddings, past_key_value,
+        )
+        new_past_key_value = (key_states, value_states) if use_cache else None
+
+        # Run gate on the same Q, K that attention will use — zero redundant projections
+        gate_output = self.gate(query_states, key_states)
+        self._last_gate_output = gate_output
+
+        # Dense attention with explicit weight computation for gate target distillation
+        scale = 1.0 / (head_dim ** 0.5)
+        attn_weights = torch.matmul(
+            query_states, key_states.transpose(-2, -1),
+        ) * scale
+
+        # Apply causal mask: tokens cannot attend to future positions.
+        # Upper-triangular -inf mask for autoregressive decoding.
+        S_q = query_states.shape[2]
+        S_k = key_states.shape[2]
+        causal_mask = torch.triu(
+            torch.full(
+                (S_q, S_k), float("-inf"),
+                device=attn_weights.device, dtype=attn_weights.dtype,
+            ),
+            diagonal=1,
+        )
+        attn_weights = attn_weights + causal_mask.unsqueeze(0).unsqueeze(0)
+
+        if attention_mask is not None:
+            ext_mask = attention_mask
+            if ext_mask.ndim == 2:
+                ext_mask = ext_mask[:, None, None, :]
+            attn_weights = attn_weights + ext_mask
+
+        # Store raw attention weights for gate target computation before softmax
+        self._last_attn_weights = attn_weights
+
+        attn_weights_softmax = F.softmax(attn_weights, dim=-1, dtype=torch.float32)
+        attn_weights_softmax = attn_weights_softmax.to(value_states.dtype)
+        attn_output = torch.matmul(attn_weights_softmax, value_states)
+
+        # Reshape [B, H, S, D] -> [B, S, hidden_dim] and apply output projection
+        attn_output = attn_output.transpose(1, 2).contiguous().reshape(bsz, q_len, hidden_dim)
+        attn_output = attn.o_proj(attn_output)
+
+        return (attn_output, attn_weights, new_past_key_value)
+
+    def _training_forward_fallback(
+        self,
+        hidden_states: torch.Tensor,
+        attention_mask: torch.Tensor | None = None,
+        position_ids: torch.Tensor | None = None,
+        past_key_value: Any | None = None,
+        use_cache: bool = False,
+        cache_position: torch.Tensor | None = None,
+        position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None,
+        **kwargs: Any,
+    ) -> tuple[torch.Tensor, ...]:
+        """Fallback training path for non-standard architectures without projection attributes.
+
+        Uses base_attn.forward(output_attentions=True) and separate Q/K extraction.
+        Incurs double Q/K projection — only used when the base module is non-standard.
 
         Returns:
             HF-compatible tuple (attn_output, attn_weights, past_key_value).
         """
-        # Run base attention with output_attentions=True for gate target computation
         base_output = self.base_attn(
             hidden_states=hidden_states,
             attention_mask=attention_mask,
@@ -361,29 +458,18 @@ class TASFTAttention(nn.Module):
             **kwargs,
         )
 
-        # Unpack base attention output (HF convention: tuple)
-        # (attn_output, attn_weights, [past_key_value])
         attn_output = base_output[0]
-        attn_weights = base_output[1]  # [B, H, S, S]
+        attn_weights = base_output[1]
         past_kv = base_output[2] if len(base_output) > 2 else None
 
-        # Store attention weights for trainer extraction
         self._last_attn_weights = attn_weights
 
-        # Extract Q, K for gate input by running the projections
-        # We get them from the base attention's internal state
-        # For HF models, Q/K are computed inside forward. We approximate by
-        # using the attention weights to derive gate targets, and run the gate
-        # on a separate Q/K projection path.
         gate_output: GateOutput | None = None
-
         if attn_weights is not None:
-            # Run gate on Q/K derived from hidden_states via base_attn projections
             q_proj, k_proj = self._extract_qk_projections(hidden_states)
             if q_proj is not None and k_proj is not None:
                 gate_output = self.gate(q_proj, k_proj)
 
-        # Store gate output for trainer extraction
         self._last_gate_output = gate_output
 
         return (attn_output, attn_weights, past_kv)
